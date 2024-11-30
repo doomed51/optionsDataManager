@@ -545,10 +545,17 @@ def main():
         start_date = datetime.now() - timedelta(days=1) # set start date to yesterday 
 
         # Only collect new data after 4:15 PM on weekdays 
-        end_date = datetime.now().date()
-        if datetime.now().weekday() <= 5 :
-            if datetime.now().hour < 16 and datetime.now().minute < 15:
+        end_date = datetime.now()
+        if end_date.weekday() <= 4 :
+            if end_date.hour < 16 and end_date.minute < 15:
                 end_date = datetime.now() - timedelta(days=1)
+        else: # if end date is a weekend set it to the previous friday
+            while end_date.weekday() > 4:
+                end_date = end_date - timedelta(days=1)
+        # if start and end dates are the same, nothing to update 
+        if start_date.date() == end_date.date():
+            logging.info("NO NEW DATA TO COLLECT!!!")
+            return
 
         collector.collect_and_store_data(
             symbol,
