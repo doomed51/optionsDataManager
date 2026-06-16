@@ -1,3 +1,9 @@
 ﻿pandas
-duckdb
 ib_insync
+psycopg2-binary
+sqlalchemy
+numpy
+scipy
+py_vollib
+schedule
+python-dotenv

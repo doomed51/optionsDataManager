@@ -50,8 +50,6 @@ class OptionsDataRetriever:
                 )
                 if bars:
                     df = util.df(bars)
-                    print(df)
-                    exit()
                     df['right'] = con.right  # Add option type (C/P)
                     df['strike'] = con.strike
                     # dfs.append(df)
@@ -63,7 +61,7 @@ class OptionsDataRetriever:
             # pause so we dont hit a rate limiter 
             self.ib.sleep(0.5)
         
-        return dfs # pd.concat(dfs) if dfs else pd.DataFrame()
+        return dfs
     
     def stream_market_data(self, 
                             contracts: List[Contract], 
