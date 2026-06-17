@@ -495,7 +495,13 @@ class OptionsDataCollector:
     def get_underlying_price_history(self, symbol: str, start_date: datetime, 
                                    end_date: datetime) -> pd.DataFrame:
         """Get historical 1d frequency underlying prices for the date range"""
-        stock = Stock(symbol, 'SMART', 'USD')
+        # stock = Stock(symbol, 'SMART', 'USD')
+        if symbol == 'SPXW':
+            symbol = 'SPX'
+        if symbol in cfg.INDEX_LIST:
+            stock = Index(symbol, cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART'), 'USD')
+        else:
+            stock = Stock(symbol, 'SMART', 'USD')
         self.ib.qualifyContracts(stock)
         
         chunks = self.get_date_chunks(start_date, end_date, '1 day')
@@ -524,7 +530,13 @@ class OptionsDataCollector:
 
     def get_option_strikes_between_range(self, symbol:str, high_price, low_price, num_strikes:int = 5) -> List[float]:
         """Get n strikes between high and low price"""
-        stock = Stock(symbol, 'SMART', 'USD')
+        exchange = cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART')
+        if symbol == 'SPXW':
+            symbol = 'SPX'
+        if symbol in cfg.INDEX_LIST:
+            stock = Index(symbol, exchange, 'USD')
+        else:
+            stock = Stock(symbol, exchange, 'USD')
         # qualify 
         self.ib.qualifyContracts(stock)
         chains = self.ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
@@ -532,10 +544,10 @@ class OptionsDataCollector:
         if not chains:
             raise ValueError(f"No option chains found for {symbol}")
             
-        chain = next(c for c in chains)
+        chain = next(c for c in chains if c.exchange == exchange)
         strikes = sorted(chain.strikes)
         # drop any strikes that are not ##.0 
-        strikes = [strike for strike in strikes if strike % 1 == 0]
+        # strikes = [strike for strike in strikes if strike % 1 == 0]
 
         # get index of strike that is num_strikes above the strike closest to the high price 
         high_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - high_price))
@@ -570,7 +582,13 @@ class OptionsDataCollector:
         low_price: Optional[float] = None
     ) -> Tuple[List[float], List[str]]:
         """Get strikes and expirations with a single chain lookup."""
-        stock = Stock(symbol, 'SMART', 'USD')
+        if symbol == 'SPXW':
+            symbol = 'SPX'
+        exchange = cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART')
+        if symbol in cfg.INDEX_LIST:
+            stock = Index(symbol, exchange, 'USD')
+        else:
+            stock = Stock(symbol, exchange, 'USD')
         self.ib.qualifyContracts(stock)
         chains = self.ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
 
@@ -604,7 +622,13 @@ class OptionsDataCollector:
     
     def get_chains(self, symbol: str) -> List:
         """Get option chains for a symbol"""
-        stock = Stock(symbol, 'SMART', 'USD')
+        if symbol == 'SPXW':
+            symbol = 'SPX'
+        exchange = cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART')
+        if symbol in cfg.INDEX_LIST:
+            stock = Index(symbol, exchange, 'USD')
+        else:
+            stock = Stock(symbol, exchange, 'USD')
         self.ib.qualifyContracts(stock)
         chains = self.ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
         
@@ -998,42 +1022,42 @@ def main():
         
 
         # _________________________________ REGULAR DATA COLLECTION ___________________________________________
-        # collector = OptionsDataCollector(ib)
-        # start_date = datetime.now() - timedelta(days=1) # set start date to yesterday 
-        # # Only collect new data after 4:15 PM on weekdays 
-        # end_date = datetime.now()
-        # if end_date.weekday() == 6 : 
-        #     start_date = datetime.now() - timedelta(days=2) # set start date to friday
+        collector = OptionsDataCollector(ib)
+        start_date = datetime.now() - timedelta(days=1) # set start date to yesterday 
+        # Only collect new data after 4:15 PM on weekdays 
+        end_date = datetime.now()
+        if end_date.weekday() == 6 : 
+            start_date = datetime.now() - timedelta(days=2) # set start date to friday
 
-        # # if start and end dates are the same, nothing to update 
-        # if start_date.date() == end_date.date():
-        #     logging.info("start and end dates are the same")
-        #     return
+        # if start and end dates are the same, nothing to update 
+        if start_date.date() == end_date.date():
+            logging.info("start and end dates are the same")
+            return
 
         
-        # for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
-        #     collector.collect_and_store_data(
-        #         key,
-        #         start_date.date(),
-        #         end_date,
-        #         num_strikes=values.get('strikes', cfg.DEFAULT_NUM_STRIKES),
-        #         num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
-        #         bar_size='1 min'
-        #     )
-        # collector.close()
+        for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
+            collector.collect_and_store_data(
+                key,
+                start_date.date(),
+                end_date,
+                num_strikes=values.get('strikes', cfg.DEFAULT_NUM_STRIKES),
+                num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
+                bar_size='1 min'
+            )
+        collector.close()
 
 
         #__________________________________ SKEW DATA COLLECTION ___________________________________________
-        skewcollector = OptionsSkewDataCollector(ib)
-        skewdata = skewcollector.collect_skew_data(
-            symbols=cfg.SKEW_DATA_SYMBOLS,
-            force=True,
-            # strike_wing=cfg.SKEW_DATA_STRIKE_WING
-        )
+        # skewcollector = OptionsSkewDataCollector(ib)
+        # skewdata = skewcollector.collect_skew_data(
+        #     symbols=cfg.SKEW_DATA_SYMBOLS,
+        #     force=True,
+        #     # strike_wing=cfg.SKEW_DATA_STRIKE_WING
+        # )
         
-        print(skewdata) 
+        # print(skewdata) 
 
-        skewcollector.close() 
+        # skewcollector.close() 
     finally:
         # collector.close()
         ib.disconnect()
