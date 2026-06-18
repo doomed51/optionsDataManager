@@ -617,7 +617,7 @@ class OptionsDataCollector:
             # if exp_date >= start_date:
             valid_expirations.append(exp)
 
-        valid_expirations.sort()
+        valid_expirations = valid_expirations.sort()
         return selected_strikes, valid_expirations[:num_expiries]
     
     def get_chains(self, symbol: str) -> List:
@@ -665,7 +665,9 @@ class OptionsDataCollector:
         # end_date = datetime.combine(end_date, datetime.min.time())
         # set time to 1700
         # create datetime object with time set to 1700
-        end_date = datetime.combine(end_date, datetime.min.time()).replace(hour=23, minute=59)
+        end_date = datetime.combine(end_date, datetime.min.time()).replace(hour=16, minute=00)
+        if symbol in cfg.INDEX_LIST:
+            end_date = datetime.combine(end_date, datetime.min.time()).replace(hour=16, minute=15)
 
         existing_dates = [row[0] for row in existing_rows]
         
@@ -803,7 +805,7 @@ class OptionsDataCollector:
                     price_history = self.get_underlying_price_history(
                         symbol, date_range_start, date_range_end
                     )                    
-                    logging.info(f"Price history for {symbol} from {date_range_start} to {date_range_end}")
+                    logging.info(f"Got Price history for {symbol} from {date_range_start} to {date_range_end}")
 
                     if not price_history.empty:
                         # Store underlying prices
@@ -884,8 +886,15 @@ class OptionsDataCollector:
                 self._set_contract_checkpoint_status(checkpoint, 'IN_PROGRESS')
 
                 expiry_str = checkpoint.expiry.strftime('%Y%m%d')
-                contract = Option(symbol, expiry_str, checkpoint.strike, checkpoint.right, 'SMART')
+                dte = (datetime.strptime(expiry_str, '%Y%m%d').date() - datetime.now().date()).days
+
+                if symbol == "SPX" and dte <=30: # workaround to handle ambiguous contracts when expiry is near 
+                    contract = Option(symbol, expiry_str, checkpoint.strike, checkpoint.right, 'SMART', tradingClass = "SPXW")
+                else:
+                    contract = Option(symbol, expiry_str, checkpoint.strike, checkpoint.right, 'SMART')
+
                 qualified_contracts = self.ib.qualifyContracts(contract)
+
                 if not qualified_contracts:
                     self._set_contract_checkpoint_status(
                         checkpoint,
