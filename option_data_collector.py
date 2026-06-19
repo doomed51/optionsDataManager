@@ -71,7 +71,7 @@ class OptionsDataCollector:
             oldest_timestamp, _ = self._request_events[0]
             wait_seconds = max(
                 0.5,
-                (oldest_timestamp + self._request_window - now).total_seconds(),
+                (oldest_timestamp + self._request_window - now).total_seconds() + 1,
             )
             self.logger.info(
                 "Pacing %s request for %.1fs (cost=%s, used=%s/%s)",
@@ -571,6 +571,46 @@ class OptionsDataCollector:
         self.ib.qualifyContracts(contract)
         return contract
 
+    def _get_strikes_from_chain(self, chain) -> List[float]:
+        """Extract and return sorted strikes from an option chain."""
+        try:
+            if len(chain) == 0:
+                logging.warning("No chains available to extract strikes.")
+                return []
+            elif len(chain) <= 1:
+                strikes = sorted([float(strike) for strike in chain[0].strikes])
+            else:
+                # if multiple chains are returned, flatten strikes from all chains and deduplicate
+                all_strikes = set()
+                for c in chain:
+                    all_strikes.update(float(strike) for strike in c.strikes)
+                strikes = sorted(all_strikes)
+                
+            return strikes
+        except Exception as e:
+            logging.error(f"Error extracting strikes from chain: {e}")
+            return []
+
+    def _get_expiries_from_chain(self, chain) -> List[str]:
+        """Extract and return sorted expirations from an option chain."""
+        try:
+            if len(chain) == 0:
+                logging.warning("No chains available to extract expirations.")
+                return []
+            elif len(chain) <= 1:
+                expiries = sorted(chain[0].expirations)
+            else:
+                # if multiple chains are returned, flatten expirations from all chains and deduplicate
+                all_expiries = set()
+                for c in chain:
+                    all_expiries.update(c.expirations)
+                expiries = sorted(all_expiries)
+
+            return expiries
+        except Exception as e:
+            logging.error(f"Error extracting expirations from chain: {e}")
+            return []
+        
     def get_option_strikes_and_expirations(
         self,
         symbol: str,
@@ -582,23 +622,32 @@ class OptionsDataCollector:
         low_price: Optional[float] = None
     ) -> Tuple[List[float], List[str]]:
         """Get strikes and expirations with a single chain lookup."""
-        if symbol == 'SPXW':
-            symbol = 'SPX'
-        exchange = cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART')
-        if symbol in cfg.INDEX_LIST:
-            stock = Index(symbol, exchange, 'USD')
-        else:
-            stock = Stock(symbol, exchange, 'USD')
-        self.ib.qualifyContracts(stock)
-        chains = self.ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
 
-        if not chains:
-            raise ValueError(f"No option chains found for {symbol}")
+        ## get option chain 
+        # if symbol == 'SPXW':
+        #     symbol = 'SPX'
+        # exchange = cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART')
+        # if symbol in cfg.INDEX_LIST:
+        #     stock = Index(symbol, exchange, 'USD')
+        # else:
+        #     stock = Stock(symbol, exchange, 'USD')
+        # self.ib.qualifyContracts(stock)
+        # chains = self.ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
 
-        chain = next(c for c in chains)
-        all_strikes = sorted(chain.strikes)
-        # all_strikes = [strike for strike in all_strikes if strike % 1 == 0]
+        # if not chains:
+        #     raise ValueError(f"No option chains found for {symbol}")
 
+        # chain = [] 
+        # for idx, c in enumerate(chains):
+        #     if c.exchange == exchange: 
+        #         logging.info(f"Retained Chain {idx}: exchange={c.exchange}, tradingClass={c.tradingClass}, multiplier={c.multiplier}, strikes={len(c.strikes)}, expirations={len(c.expirations)}")
+        #         chain.append(c)
+        
+        chain = self.get_chains(symbol)
+        all_strikes = self._get_strikes_from_chain(chain)
+        all_expiries = self._get_expiries_from_chain(chain)
+
+        # if high and low price are provided, get strikes around that range, otherwise get strikes around current price
         if high_price is not None and low_price is not None:
             high_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - high_price))
             low_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - low_price))
@@ -611,14 +660,15 @@ class OptionsDataCollector:
         else:
             raise ValueError("Provide either current_price or both high_price and low_price")
 
-        valid_expirations = []
-        for exp in chain.expirations:
-            exp_date = datetime.strptime(exp, '%Y%m%d')
-            # if exp_date >= start_date:
-            valid_expirations.append(exp)
+        # valid_expirations = []
+        # for exp in chain.expirations:
+        #     exp_date = datetime.strptime(exp, '%Y%m%d')
+        #     # if exp_date >= start_date:
+        #     valid_expirations.append(exp)
 
-        valid_expirations = valid_expirations.sort()
-        return selected_strikes, valid_expirations[:num_expiries]
+        # valid_expirations = valid_expirations.sort()
+        
+        return selected_strikes, all_expiries[:num_expiries]
     
     def get_chains(self, symbol: str) -> List:
         """Get option chains for a symbol"""
@@ -634,7 +684,13 @@ class OptionsDataCollector:
         
         if not chains:
             raise ValueError(f"No option chains found for {symbol}")
-            
+
+        chain = [] 
+        for idx, c in enumerate(chains):
+            if c.exchange == exchange: 
+                logging.info(f"Retained Chain {idx}: exchange={c.exchange}, tradingClass={c.tradingClass}, multiplier={c.multiplier}, strikes={len(c.strikes)}, expirations={len(c.expirations)}")
+                chain.append(c)
+
         return chains
 
     def create_option_contracts(self, symbol: str, strikes: List[float], 
@@ -879,7 +935,8 @@ class OptionsDataCollector:
             reference_price=float(current_price),
         )
 
-        logging.info(f"Queued {len(queue)} contracts for {symbol} on {trade_date}")
+        logging.info(f"Queued {len(queue)} contracts for {symbol} on {trade_date} across {len(strikes)} strikes and {len(expirations)} expirations")
+        logging.info(f"Strikes: {strikes}, Expirations: {expirations}")
 
         for checkpoint in queue:
             try:
@@ -1056,7 +1113,7 @@ def main():
         collector.close()
 
 
-        #__________________________________ SKEW DATA COLLECTION ___________________________________________
+        # #__________________________________ SKEW DATA COLLECTION ___________________________________________
         # skewcollector = OptionsSkewDataCollector(ib)
         # skewdata = skewcollector.collect_skew_data(
         #     symbols=cfg.SKEW_DATA_SYMBOLS,
