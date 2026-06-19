@@ -124,7 +124,7 @@ class OptionsSkewDataCollector:
 
         return (current_time - last_time).total_seconds() >= (min_interval_hours * 3600)
 
-    def _get_option_chain(self, symbol: str, exchange="SMART") -> List[Contract]:
+    def _get_option_chain(self, symbol: str, exchange="SMART", trading_class=None) -> List[Contract]:
         """Fetch and return the primary option chain definition for a symbol."""
         if symbol in cfg.INDEX_LIST:
             exchange = cfg.EXCHANGE_MAPPINGS_INDEX.get(symbol, 'SMART')
@@ -136,10 +136,11 @@ class OptionsSkewDataCollector:
 
         if not chains:
             raise ValueError(f"No option chains found for {symbol}")
+
         
         chains_ = []
         for idx, c in enumerate(chains):
-            if c.exchange == exchange: 
+            if c.exchange == exchange and (trading_class is None or c.tradingClass == trading_class):
                 logger.info(f"Retained Chain {idx}: exchange={c.exchange}, tradingClass={c.tradingClass}, multiplier={c.multiplier}, strikes={len(c.strikes)}, expirations={len(c.expirations)}")
                 chains_.append(c)
 
@@ -152,7 +153,7 @@ class OptionsSkewDataCollector:
                 logger.warning("No chains available to extract strikes.")
                 return []
             elif len(chain) <= 1:
-                strikes = sorted([float(strike) for strike in chain.strikes])
+                strikes = sorted([float(strike) for strike in chain[0].strikes])
             else:
                 # if multiple chains are returned, flatten strikes from all chains and deduplicate
                 all_strikes = set()
@@ -173,7 +174,7 @@ class OptionsSkewDataCollector:
                 logger.warning("No chains available to extract expirations.")
                 return []
             elif len(chain) <= 1:
-                expiries = sorted(chain.expirations)
+                expiries = sorted(chain[0].expirations)
             else:
                 # if multiple chains are returned, flatten expirations from all chains and deduplicate
                 all_expiries = set()
@@ -302,7 +303,7 @@ class OptionsSkewDataCollector:
             return {}
 
     @staticmethod
-    def _calculate_moneyness_offset_for_delta_and_dte(delta: float, dte: int) -> float:
+    def _calculate_moneyness_offset_for_delta_and_dte(delta: float, dte: int, option_type: str) -> float:
         """
         Heuristic to calculate moneyness offset based on delta and DTE.
         This can be refined with empirical data or a more sophisticated model.
@@ -338,6 +339,8 @@ class OptionsSkewDataCollector:
 
         scale = ((max(1, dte) / cfg.TENOR_DELTA_DTE_REF_DAYS)) ** cfg.TENOR_DELTA_DTE_OFFSET_ALPHA
 
+        scale = scale * 1.5 if option_type == 'P' else scale  # More aggressive scaling for puts (negative delta)
+
         logger.info(f"Calculated moneyness offset for delta {delta} and DTE {dte}: base_offset={base_offset}, scale={scale}, final_offset={base_offset * scale}")
 
         return base_offset * scale
@@ -363,7 +366,7 @@ class OptionsSkewDataCollector:
     ) -> float:
         # rounded_delta = round(float(target_delta_abs), 2)
         dte = (datetime.strptime(expiry, '%Y%m%d').date() - datetime.now().date()).days
-        offset = self._calculate_moneyness_offset_for_delta_and_dte(target_delta_abs, dte)
+        offset = self._calculate_moneyness_offset_for_delta_and_dte(target_delta_abs, dte, option_type)
 
         if option_type == 'C':
             guessed_strike = float(spot_price) * (1.0 + offset)
@@ -515,58 +518,81 @@ class OptionsSkewDataCollector:
 
         if not starting_candidate:
             logger.info(f"Starting strike {chain_strikes[start_idx]} is invalid, searching for nearest valid strike")
-            candidate_above_starting_strike = self._get_cached_or_fetch_option_market_data(
-                symbol=symbol,
-                expiry=expiry,
-                strike=float(chain_strikes[min(start_idx + 1, len(chain_strikes) - 1)]),
-                option_type=option_type,
-                market_data_cache=market_data_cache,
-            )
-            visited_indices.add(min(start_idx + 1, len(chain_strikes) - 1))
-            completeness_flag = 0 if self._is_complete_market_reading(candidate_above_starting_strike) else 1
-            strike_gap = abs(float(chain_strikes[min(start_idx + 1, len(chain_strikes) - 1)]) - float(spot_price))
-            candidate_score_above_starting_strike = (abs(float(candidate_above_starting_strike.get('delta', np.nan)) - float(target_delta_signed)) if candidate_above_starting_strike else None, completeness_flag, strike_gap)
 
-            candidate_below_starting_strike = self._get_cached_or_fetch_option_market_data(
-                symbol=symbol,
-                expiry=expiry,
-                strike=float(chain_strikes[max(start_idx - 1, 0)]),
-                option_type=option_type,
-                market_data_cache=market_data_cache,
-            )
-            visited_indices.add(max(start_idx - 1, 0))
-            completeness_flag = 0 if self._is_complete_market_reading(candidate_below_starting_strike) else 1
-            strike_gap = abs(float(chain_strikes[max(start_idx - 1, 0)]) - float(spot_price))
-            candidate_score_below_starting_strike = (abs(float(candidate_below_starting_strike.get('delta', np.nan)) - float(target_delta_signed)) if candidate_below_starting_strike else None, completeness_flag, strike_gap)
+            candidate_above_idx = start_idx + 1
+            candidate_below_idx = start_idx - 1
+            while True: 
+                candidate_above_starting_strike = self._get_cached_or_fetch_option_market_data(
+                    symbol=symbol,
+                    expiry=expiry,
+                    strike=float(chain_strikes[min(candidate_above_idx, len(chain_strikes) - 1)]),
+                    option_type=option_type,
+                    market_data_cache=market_data_cache,
+                )
+                visited_indices.add(min(candidate_above_idx, len(chain_strikes) - 1))
+                if candidate_above_starting_strike is not None:
+                    completeness_flag = 0 if self._is_complete_market_reading(candidate_above_starting_strike) else 1
+                    strike_gap = abs(float(chain_strikes[min(candidate_above_idx, len(chain_strikes) - 1)]) - float(spot_price))
+                    candidate_score_above_starting_strike = (abs(float(candidate_above_starting_strike.get('delta', np.nan)) - float(target_delta_signed)) if candidate_above_starting_strike else None, completeness_flag, strike_gap)
+                    break
+
+                candidate_above_idx += 1
+                if candidate_above_idx >= len(chain_strikes):
+                    candidate_above_starting_strike = None
+                    candidate_score_above_starting_strike = None
+                    break
+
+            while True:
+                candidate_below_starting_strike = self._get_cached_or_fetch_option_market_data(
+                    symbol=symbol,
+                    expiry=expiry,
+                    strike=float(chain_strikes[max(candidate_below_idx, 0)]),
+                    option_type=option_type,
+                    market_data_cache=market_data_cache,
+                )
+                visited_indices.add(max(candidate_below_idx, 0))
+                if candidate_below_starting_strike is not None:
+                    completeness_flag = 0 if self._is_complete_market_reading(candidate_below_starting_strike) else 1
+                    strike_gap = abs(float(chain_strikes[max(candidate_below_idx, 0)]) - float(spot_price))
+                    candidate_score_below_starting_strike = (abs(float(candidate_below_starting_strike.get('delta', np.nan)) - float(target_delta_signed)) if candidate_below_starting_strike else None, completeness_flag, strike_gap)
+                    break
+                candidate_below_idx -= 1
+                if candidate_below_idx < 0:
+                    candidate_below_starting_strike = None
+                    candidate_score_below_starting_strike = None
+                    break
 
             if candidate_score_above_starting_strike is not None and (candidate_score_below_starting_strike is None or candidate_score_above_starting_strike < candidate_score_below_starting_strike):
-                logger.info(f"Starting strike {chain_strikes[start_idx]} is invalid, but candidate above starting strike {chain_strikes[min(start_idx + 1, len(chain_strikes) - 1)]} has better score ({candidate_score_above_starting_strike}) than candidate below starting strike {chain_strikes[max(start_idx - 1, 0)]} ({candidate_score_below_starting_strike}), setting direction to up")
+                logger.info(f"Candidate above starting strike {chain_strikes[min(candidate_above_idx, len(chain_strikes) - 1)]} has better score ({candidate_score_above_starting_strike}) than candidate below starting strike {chain_strikes[max(candidate_below_idx, 0)]} ({candidate_score_below_starting_strike}), setting direction to up")
                 direction = 1
-                best_candidate = candidate_above_starting_strike
+                best_candidate = (candidate_above_starting_strike, abs(float(candidate_above_starting_strike.get('delta', np.nan)) - float(target_delta_signed)))
                 best_score = candidate_score_above_starting_strike
-                starting_strike = float(chain_strikes[min(start_idx + 1, len(chain_strikes) - 1)])
-                start_idx = min(start_idx + 1, len(chain_strikes) - 1)
+                starting_strike = float(chain_strikes[min(candidate_above_idx, len(chain_strikes) - 1)])
+                start_idx = min(candidate_above_idx, len(chain_strikes) - 1)
 
             elif candidate_score_below_starting_strike is not None and (candidate_score_above_starting_strike is None or candidate_score_below_starting_strike < candidate_score_above_starting_strike):
-                logger.info(f"Starting strike {chain_strikes[start_idx]} is invalid, but candidate below starting strike {chain_strikes[max(start_idx - 1, 0)]} has better score ({candidate_score_below_starting_strike}) than candidate above starting strike {chain_strikes[min(start_idx + 1, len(chain_strikes) - 1)]} ({candidate_score_above_starting_strike}), setting direction to down")
+                logger.info(f"Candidate below starting strike {chain_strikes[max(candidate_below_idx, 0)]} has better score ({candidate_score_below_starting_strike}) than candidate above starting strike {chain_strikes[min(candidate_above_idx, len(chain_strikes) - 1)]} ({candidate_score_above_starting_strike}), setting direction to down")
                 direction = -1
-                best_candidate = candidate_below_starting_strike
+                best_candidate = (candidate_below_starting_strike, abs(float(candidate_below_starting_strike.get('delta', np.nan)) - float(target_delta_signed)))
                 best_score = candidate_score_below_starting_strike
-                starting_strike = float(chain_strikes[max(start_idx - 1, 0)])
-                start_idx = max(start_idx - 1, 0)
+                starting_strike = float(chain_strikes[max(candidate_below_idx, 0)])
+                start_idx = max(candidate_below_idx, 0)
 
             logger.info(f"Starting strike set to {chain_strikes[start_idx]} with score {best_score} and direction {direction}")
 
         else: 
             completeness_flag = 0 if self._is_complete_market_reading(starting_candidate) else 1
             strike_gap = abs(float(chain_strikes[start_idx]) - float(spot_price))
-            starting_candidate_score = abs(float(starting_candidate.get('delta', np.nan)) - float(target_delta_signed))
+            starting_candidate_score = (abs(float(starting_candidate.get('delta', np.nan)) - float(target_delta_signed)), completeness_flag, strike_gap)
             if starting_candidate_score is not None:
-                best_candidate = starting_candidate
-                best_score = (starting_candidate_score, completeness_flag, strike_gap)
-                logger.info(f"Starting strike {chain_strikes[start_idx]} is valid with score {starting_candidate_score}, setting as initial best candidate")
+                best_candidate = (starting_candidate, abs(float(starting_candidate.get('delta', np.nan)) - float(target_delta_signed)))
+                best_score = starting_candidate_score
+                logger.info(f"Starting strike {chain_strikes[start_idx]} is valid with delta {abs(float(starting_candidate.get('delta', np.nan)))}, setting as initial best candidate")
 
-        for radius in range(max_radius + 1):
+        valid_contracts_evaluated = 1 if best_candidate else 0
+        radius = 0 
+        # for radius in range(max_radius + 1):
+        while True:
             indices = []
             if radius == 0:
                 indices.append(start_idx)
@@ -580,16 +606,8 @@ class OptionsSkewDataCollector:
                     indices.append(start_idx - radius)
                     indices.append(start_idx + radius)
 
-                # left_idx = start_idx - radius
-                # right_idx = start_idx + radius
-                # if left_idx >= 0:
-                #     indices.append(left_idx)
-                # if right_idx < len(chain_strikes) and right_idx != left_idx:
-                #     indices.append(right_idx)
-
             if not indices:
                 break
-
 
             improved_this_round = False
             repeat_visit = False
@@ -619,15 +637,12 @@ class OptionsSkewDataCollector:
                     sleep(0.2)  # brief pause before retrying
                     idx += direction if direction != 0 else (1 if strike < starting_strike else -1)
 
-                # print(strike)
-                # exit() 
                 if not candidate:
                     continue
 
                 candidate_delta = candidate.get('delta')
                 if candidate_delta is None or pd.isna(candidate_delta):
                     continue
-
                 delta_gap = abs(float(candidate_delta) - float(target_delta_signed))
                 completeness_flag = 0 if self._is_complete_market_reading(candidate) else 1
                 strike_gap = abs(strike - float(spot_price))
@@ -638,8 +653,9 @@ class OptionsSkewDataCollector:
                     best_candidate = (candidate, delta_gap)
                     improved_this_round = True
 
-                    # sets the direction of traversal for the next iteration
                     direction = -1 if strike < starting_strike else (1 if strike > starting_strike else 0)
+
+                valid_contracts_evaluated += 1
 
             if radius > 0:
                 if improved_this_round:
@@ -655,7 +671,13 @@ class OptionsSkewDataCollector:
                     logger.info(f"Stopping traversal after {no_improvement_count} consecutive non-improving strikes at radius {radius} for option {symbol} {expiry} {option_type}")
                     break
 
-        return best_candidate, delta_gap
+            if valid_contracts_evaluated >= (max_hops + 1):
+                logger.info(f"Reached maximum valid contracts evaluated ({valid_contracts_evaluated}) at radius {radius} for option {symbol} {expiry} {option_type}, stopping traversal")
+                break
+
+            radius += 1
+
+        return best_candidate
 
     @staticmethod
     def _is_complete_market_reading(data: Dict) -> bool:
@@ -1204,14 +1226,20 @@ class OptionsSkewDataCollector:
                     raise ValueError(f"Failed to get underlying price for {symbol}")
 
                 spot_price = float(underlying_data['price'])
-                chain = self._get_option_chain(symbol)
+                chain = self._get_option_chain(symbol, trading_class="SPX" if symbol == "SPX" else None)
 
                 chain_strikes = self._get_strikes_from_chain(chain)
+
                 
                 if not chain_strikes:
                     raise ValueError(f"No chain strikes found for {symbol}")
 
                 tenor_expiration_map = self.get_expirations_near_tenors(symbol, tenors_dte, chain=chain)
+
+                # print(chain)
+                # print(chain_strikes) 
+                # print(tenor_expiration_map)
+                # exit() 
                 
                 if not tenor_expiration_map:
                     raise ValueError(f"No valid expirations found for {symbol}")
@@ -1320,7 +1348,7 @@ class OptionsSkewDataCollector:
                                 logger.info(f"Starting strike for {symbol} {option_type} {tenor_expiry} delta {delta_abs}: {starting_strike}")
 
                                 # CHANGE: given the starting strike, traverse the LIVE chain, selecting the best strike given target delta  
-                                selected = self._select_best_by_strike_traversal(
+                                selected_data, delta_gap = self._select_best_by_strike_traversal(
                                     symbol=symbol,
                                     expiry=tenor_expiry,
                                     option_type=option_type,
@@ -1334,10 +1362,11 @@ class OptionsSkewDataCollector:
                                         getattr(cfg, 'TENOR_DELTA_TRAVERSAL_NO_IMPROVEMENT_PATIENCE', 4)
                                     ),
                                 )
-                                print(selected)
-                                exit() 
 
-                                if selected is None:
+                                logger.info(f"Selected strike for {symbol} {option_type} {tenor_expiry} delta {delta_abs}: {selected_data['contract'].strike if selected_data else None} with delta gap {delta_gap if selected_data else None}")
+                                
+
+                                if selected_data is None:
                                     session.add(TenorDeltaTargetStatus(
                                         batch_id=batch_id,
                                         symbol=symbol,
@@ -1351,7 +1380,7 @@ class OptionsSkewDataCollector:
                                     missing_targets += 1
                                     continue
 
-                                selected_data, delta_gap = selected
+                                # selected_data, delta_gap = selected
                                 contract = selected_data['contract']
 
                                 if not self._is_complete_market_reading(selected_data):
