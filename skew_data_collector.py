@@ -355,15 +355,78 @@ class OptionsSkewDataCollector:
     def _market_cache_key(expiry: str, strike: float, option_type: str) -> Tuple[str, float, str]:
         return (str(expiry), round(float(strike), 6), str(option_type))
 
+    def _get_historical_starting_strike(
+        self,
+        symbol: str,
+        target_tenor_dte: int,
+        target_delta_abs: float,
+        option_type: str,
+        spot_price: float,
+    ) -> Optional[float]:
+        """
+        Fetch a historical strike seed for a matching tenor/delta/type target.
+        Selection priority: latest snapshot, then best delta gap, then nearest to current spot.
+        """
+        with self.db_manager.get_session() as session:
+            rows = (
+                session.query(TenorDeltaOptionsSnapshot)
+                .filter(
+                    and_(
+                        TenorDeltaOptionsSnapshot.symbol == symbol,
+                        TenorDeltaOptionsSnapshot.option_type == option_type,
+                        TenorDeltaOptionsSnapshot.target_tenor_dte == int(target_tenor_dte),
+                        TenorDeltaOptionsSnapshot.target_delta_abs == float(target_delta_abs),
+                    )
+                )
+                .order_by(
+                    TenorDeltaOptionsSnapshot.snapshot_time.desc(),
+                    TenorDeltaOptionsSnapshot.delta_gap_abs.asc(),
+                )
+                .limit(10)
+                .all()
+            )
+
+        if not rows:
+            return None
+
+        best_row = min(
+            rows,
+            key=lambda row: (
+                abs(float(getattr(row, 'underlying_price', np.nan)) - float(spot_price))
+                if getattr(row, 'underlying_price', None) is not None and not pd.isna(getattr(row, 'underlying_price', np.nan))
+                else float('inf')
+            ),
+        )
+
+        return float(best_row.strike) if best_row and best_row.strike is not None else None
+
     def _choose_starting_strike(
         self,
-        candidate_strikes: List[float],
+        symbol: str,
+        target_tenor_dte: int,
+        candidate_strikes: Optional[List[float]],
         chain_strikes: List[float],
         spot_price: float,
         target_delta_abs: float,
         option_type: str,
         expiry: str,
     ) -> float:
+        historical_strike = self._get_historical_starting_strike(
+            symbol=symbol,
+            target_tenor_dte=int(target_tenor_dte),
+            target_delta_abs=float(target_delta_abs),
+            option_type=option_type,
+            spot_price=float(spot_price),
+        )
+        if historical_strike is not None:
+            idx = self._nearest_strike_index(chain_strikes, historical_strike)
+            selected = float(chain_strikes[idx])
+            logger.info(
+                f"Using historical starting strike for {symbol} {option_type} tenor={target_tenor_dte} "
+                f"delta={target_delta_abs}: raw={historical_strike}, selected={selected}"
+            )
+            return selected
+
         # rounded_delta = round(float(target_delta_abs), 2)
         dte = (datetime.strptime(expiry, '%Y%m%d').date() - datetime.now().date()).days
         offset = self._calculate_moneyness_offset_for_delta_and_dte(target_delta_abs, dte, option_type)
@@ -374,8 +437,14 @@ class OptionsSkewDataCollector:
             guessed_strike = float(spot_price) * (1.0 - offset)
 
         if candidate_strikes:
+            logger.info(
+                f"Using candidate-based starting strike for {symbol} {option_type} tenor={target_tenor_dte} delta={target_delta_abs}"
+            )
             return min(candidate_strikes, key=lambda strike: abs(float(strike) - guessed_strike))
 
+        logger.info(
+            f"Using heuristic starting strike for {symbol} {option_type} tenor={target_tenor_dte} delta={target_delta_abs}"
+        )
         idx = self._nearest_strike_index(chain_strikes, guessed_strike)
         return float(chain_strikes[idx])
 
@@ -1338,6 +1407,8 @@ class OptionsSkewDataCollector:
 
                                 # CHANGE: use the candidate logic here to seed a starting strike 
                                 starting_strike = self._choose_starting_strike(
+                                    symbol=symbol,
+                                    target_tenor_dte=int(tenor),
                                     candidate_strikes=None,
                                     chain_strikes=chain_strikes,
                                     spot_price=spot_price,

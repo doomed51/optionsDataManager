@@ -10,16 +10,26 @@ conn = duckdb.connect('data/options_data.db')
 # print('\n')
 
 # ## Main options history table(s)
-# read_query = 'SELECT * FROM options_historical_data'
-# df = conn.execute(read_query).fetchdf()
+read_query = 'SELECT * FROM options_historical_data'
+df = conn.execute(read_query).fetchdf()
 # print('options_historical_data Table')
 # print(df.columns)
+# unique expiry in options_historical_data
+print(df['expiry'].unique())
+
+# print unique date for exipry = 2024-12-03
+print('\n')
+unique_dates = df[df['expiry'] == '2024-12-03']['date'].max()
+print(unique_dates)
+
+exit()
 
 # underlying table 
 print('\n')
 read_query = 'SELECT * FROM underlying_price_history'
 df = conn.execute(read_query).fetchdf()
 print(df)
+
 
 ## Collection Progress Table
 print('\n')

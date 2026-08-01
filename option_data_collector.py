@@ -2,7 +2,8 @@ from collections import deque
 from typing import Deque, List, Optional, Dict, Tuple
 from ib_insync import IB, Contract, Option, Stock, Index, Future, util
 import pandas as pd
-from datetime import datetime, timedelta, date as dt_date
+from datetime import datetime, time, timedelta, date as dt_date
+import time as time_ 
 import logging
 import math
 from pathlib import Path
@@ -1083,47 +1084,78 @@ def main():
     
     ib = IB()
     try:
-        ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
-        
-        
+        current_time = datetime.now().time()
+
+        # while True:
+        #     if current_time <= time(16, 1):
+        #         continue
+        #     break
+
 
         # _________________________________ REGULAR DATA COLLECTION ___________________________________________
-        collector = OptionsDataCollector(ib)
-        start_date = datetime.now() - timedelta(days=1) # set start date to yesterday 
-        # Only collect new data after 4:15 PM on weekdays 
-        end_date = datetime.now()
-        if end_date.weekday() == 6 : 
-            start_date = datetime.now() - timedelta(days=2) # set start date to friday
+        if current_time > time(15, 0):
+            logging.info(f"Running regular data collection at {current_time}")
+            # input("continue?")
 
-        # if start and end dates are the same, nothing to update 
-        if start_date.date() == end_date.date():
-            logging.info("start and end dates are the same")
-            return
+            seconds_until_415 = (datetime.combine(datetime.now().date(), time(16, 15)) - datetime.now()).total_seconds() + 5
+            if seconds_until_415 > 5:
+                logging.info(f"Sleeping for {seconds_until_415} seconds until 4:15 PM")
+                time_.sleep(seconds_until_415)
 
-        
-        for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
-            collector.collect_and_store_data(
-                key,
-                start_date.date(),
-                end_date,
-                num_strikes=values.get('strikes', cfg.DEFAULT_NUM_STRIKES),
-                num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
-                bar_size='1 min'
-            )
-        collector.close()
+            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
+            collector = OptionsDataCollector(ib)
+            start_date = datetime.now() - timedelta(days=1) # set start date to yesterday 
+            # Only collect new data after 4:15 PM on weekdays 
+            end_date = datetime.now()
+            if end_date.weekday() == 6 : 
+                start_date = datetime.now() - timedelta(days=2) # set start date to friday
+
+            # if start and end dates are the same, nothing to update 
+            if start_date.date() == end_date.date():
+                logging.info("start and end dates are the same")
+                return
+
+            
+            for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
+                collector.collect_and_store_data(
+                    key,
+                    start_date.date(),
+                    end_date,
+                    num_strikes=values.get('strikes', cfg.DEFAULT_NUM_STRIKES),
+                    num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
+                    bar_size='1 min'
+                )
+            collector.close()
 
 
         # #__________________________________ SKEW DATA COLLECTION ___________________________________________
-        # skewcollector = OptionsSkewDataCollector(ib)
-        # skewdata = skewcollector.collect_skew_data(
-        #     symbols=cfg.SKEW_DATA_SYMBOLS,
-        #     force=True,
-        #     # strike_wing=cfg.SKEW_DATA_STRIKE_WING
-        # )
         
-        # print(skewdata) 
+        # while True: 
+        #     current_time = datetime.now().time()
+        #     if current_time >= time(15, 0): # stop running after 3 pm 
+        #         break
+        #     print(current_time)
+        #     if current_time.hour in [10]:
+        #         print("TIMEEEEEEEEEEEEEEEE")
+        #     if current_time in [time(10,0), time(12,0), time(14,0)]:
+                # logging.info(f"Running skew data collection at {current_time}")
+                # try:
+        elif current_time < time(15, 0):
+            logging.info(f"Running skew data collection at {current_time}")
+            input("continue?")
+            
+            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
+            skewcollector = OptionsSkewDataCollector(ib)
+            skewdata = skewcollector.collect_skew_data(
+                symbols=cfg.SKEW_DATA_SYMBOLS,
+                force=True,
+                # strike_wing=cfg.SKEW_DATA_STRIKE_WING
+            )
+            
+            print(skewdata) 
 
-        # skewcollector.close() 
+            skewcollector.close() 
+
     finally:
         # collector.close()
         ib.disconnect()

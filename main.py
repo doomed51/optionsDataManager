@@ -1,3 +1,8 @@
-import option_data_collector
+"""
+Main entry point for the Options Data Manager
+Runs the enhanced options data collection with IV and Greeks
+"""
+import option_greeks_update
 
-option_data_collector.main()
+if __name__ == "__main__":
+    option_greeks_update.main()
