@@ -1075,47 +1075,60 @@ class OptionsDataCollector:
         self.db_manager.close()
 
 def main():
-    # logging.basicConfig(level=logging.INFO)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(message)s',
         datefmt='%H:%M:%S'
     )
-    
-    ib = IB()
-    try:
-        current_time = datetime.now().time()
 
-        # while True:
-        #     if current_time <= time(16, 1):
-        #         continue
-        #     break
+    skew_schedule = [
+        ('10:00', time(10, 0)),
+        ('12:00', time(12, 0)),
+        ('14:00', time(14, 0)),
+    ]
+    regular_run_time = time(16, 15)
 
+    today = datetime.now().date()
+    if today.weekday() > 4:
+        logging.info("Weekend detected; scheduler only runs Monday through Friday. Exiting.")
+        return
 
-        # _________________________________ REGULAR DATA COLLECTION ___________________________________________
-        if current_time > time(15, 0):
-            logging.info(f"Running regular data collection at {current_time}")
-            # input("continue?")
+    skew_done = {label: False for label, _ in skew_schedule}
+    regular_done = False
 
-            seconds_until_415 = (datetime.combine(datetime.now().date(), time(16, 15)) - datetime.now()).total_seconds() + 5
-            if seconds_until_415 > 5:
-                logging.info(f"Sleeping for {seconds_until_415} seconds until 4:15 PM")
-                time_.sleep(seconds_until_415)
+    def run_skew_collection_once() -> None:
+        ib = IB()
+        skew_collector = None
+        try:
+            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
+            skew_collector = OptionsSkewDataCollector(ib)
+            skew_data = skew_collector.collect_skew_data(
+                symbols=cfg.SKEW_DATA_SYMBOLS,
+                force=True,
+            )
+            logging.info(f"Skew collection completed with results: {skew_data}")
+        finally:
+            if skew_collector is not None:
+                skew_collector.close()
+            if ib.isConnected():
+                ib.disconnect()
 
+    def run_regular_collection_once() -> None:
+        ib = IB()
+        collector = None
+        try:
             ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
             collector = OptionsDataCollector(ib)
-            start_date = datetime.now() - timedelta(days=1) # set start date to yesterday 
-            # Only collect new data after 4:15 PM on weekdays 
-            end_date = datetime.now()
-            if end_date.weekday() == 6 : 
-                start_date = datetime.now() - timedelta(days=2) # set start date to friday
 
-            # if start and end dates are the same, nothing to update 
+            start_date = datetime.now() - timedelta(days=1)
+            end_date = datetime.now()
+            if end_date.weekday() == 6:
+                start_date = datetime.now() - timedelta(days=2)
+
             if start_date.date() == end_date.date():
-                logging.info("start and end dates are the same")
+                logging.info("Regular collection skipped because start and end dates are the same")
                 return
 
-            
             for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
                 collector.collect_and_store_data(
                     key,
@@ -1125,40 +1138,54 @@ def main():
                     num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
                     bar_size='1 min'
                 )
-            collector.close()
+            logging.info("Regular data collection completed")
+        finally:
+            if collector is not None:
+                collector.close()
+            if ib.isConnected():
+                ib.disconnect()
 
+    logging.info("Daily scheduler started. Waiting for 10:00, 12:00, 14:00 skew runs and 16:15 regular run.")
 
-        # #__________________________________ SKEW DATA COLLECTION ___________________________________________
-        
-        # while True: 
-        #     current_time = datetime.now().time()
-        #     if current_time >= time(15, 0): # stop running after 3 pm 
-        #         break
-        #     print(current_time)
-        #     if current_time.hour in [10]:
-        #         print("TIMEEEEEEEEEEEEEEEE")
-        #     if current_time in [time(10,0), time(12,0), time(14,0)]:
-                # logging.info(f"Running skew data collection at {current_time}")
-                # try:
-        elif current_time < time(15, 0):
-            logging.info(f"Running skew data collection at {current_time}")
-            input("continue?")
-            
-            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
-            skewcollector = OptionsSkewDataCollector(ib)
-            skewdata = skewcollector.collect_skew_data(
-                symbols=cfg.SKEW_DATA_SYMBOLS,
-                force=True,
-                # strike_wing=cfg.SKEW_DATA_STRIKE_WING
-            )
-            
-            print(skewdata) 
+    while True:
+        now = datetime.now()
 
-            skewcollector.close() 
+        if now.date() != today:
+            logging.info("Date changed before schedule completion. Exiting to avoid cross-day runs.")
+            return
 
-    finally:
-        # collector.close()
-        ib.disconnect()
+        if now.weekday() > 4:
+            logging.info("Weekend reached; exiting scheduler.")
+            return
+
+        current_time = now.time()
+
+        for slot_label, slot_time in skew_schedule:
+            if skew_done[slot_label]:
+                continue
+            if current_time >= slot_time:
+                logging.info(f"Triggering skew collection for {slot_label} slot at {current_time}")
+                try:
+                    run_skew_collection_once()
+                except Exception as e:
+                    logging.error(f"Skew collection failed for {slot_label}: {e}")
+                finally:
+                    skew_done[slot_label] = True
+
+        if (not regular_done) and current_time >= regular_run_time:
+            logging.info(f"Triggering regular collection at {current_time}")
+            try:
+                run_regular_collection_once()
+            except Exception as e:
+                logging.error(f"Regular collection failed: {e}")
+            finally:
+                regular_done = True
+
+        if all(skew_done.values()) and regular_done:
+            logging.info("All scheduled runs have been attempted once. Exiting.")
+            return
+
+        time_.sleep(30)
 
 
 # ___________________________________________ DEBUG AND TESTING ___________________________________________
