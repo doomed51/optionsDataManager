@@ -244,6 +244,9 @@ class OptionsHistoricalData(Base):
     low = Column(Float)
     close = Column(Float)
     volume = Column(Integer)
+    trade_count = Column(Integer)
+    vwap = Column(Float)
+    volume = Column(Integer)
     underlying_price = Column(Float)
     collection_batch = Column(String(64), index=True)
     created_at = Column(DateTime, default=func.now())
@@ -331,6 +334,109 @@ class ContractCheckpoint(Base):
         Index('idx_checkpoint_queue', 'batch_id', 'status', 'expiry', 'strike'),
         Index('idx_checkpoint_trade_day', 'symbol', 'trade_date', 'status'),
     )
+
+
+class ThetaDataOptionHistory(Base):
+    """ThetaData option history keyed by contract, interval, and bar timestamp."""
+    __tablename__ = 'thetadata_option_history'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False, index=True)
+    expiry = Column(Date, nullable=False, index=True)
+    strike = Column(Float, nullable=False)
+    right = Column(String(1), nullable=False)
+    interval = Column(String(8), nullable=False)
+    timestamp = Column(DateTime, nullable=False, index=True)
+
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Integer)
+    trade_count = Column(Integer)
+    vwap = Column(Float)
+    bid = Column(Float)
+    ask = Column(Float)
+    bid_size = Column(Integer)
+    ask_size = Column(Integer)
+    open_interest = Column(Integer)
+    bid_implied_vol = Column(Float)
+    ask_implied_vol = Column(Float)
+    implied_volatility = Column(Float)
+    iv_error = Column(Float)
+    underlying_price = Column(Float)
+    delta = Column(Float)
+    theta = Column(Float)
+    vega = Column(Float)
+    rho = Column(Float)
+    epsilon = Column(Float)
+    lambda_ = Column('lambda', Float)
+
+    collection_batch = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol',
+            'expiry',
+            'strike',
+            'right',
+            'interval',
+            'timestamp',
+            name='unique_thetadata_option_history_bar',
+        ),
+        Index(
+            'idx_thetadata_option_history_contract_interval',
+            'symbol',
+            'expiry',
+            'strike',
+            'right',
+            'interval',
+            'timestamp',
+        ),
+    )
+
+
+class ThetaDataCollectionCheckpoint(Base):
+    """Resumable status for ThetaData endpoint and contract-day work."""
+    __tablename__ = 'thetadata_collection_checkpoints'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False, index=True)
+    expiry = Column(Date)
+    strike = Column(Float)
+    right = Column(String(1))
+    interval = Column(String(8))
+    trade_date = Column(Date)
+    dataset = Column(String(40), nullable=False)
+    status = Column(String(40), nullable=False, default='PENDING', index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_retry_at = Column(DateTime)
+    last_error = Column(Text)
+    collection_batch = Column(String(64), index=True)
+    completed_at = Column(DateTime)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol',
+            'expiry',
+            'strike',
+            'right',
+            'interval',
+            'trade_date',
+            'dataset',
+            name='unique_thetadata_collection_checkpoint',
+        ),
+        Index(
+            'idx_thetadata_checkpoint_status_retry',
+            'status',
+            'next_retry_at',
+        ),
+    )
+
 
 class DatabaseManager:
     """

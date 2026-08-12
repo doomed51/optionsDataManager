@@ -98,6 +98,7 @@ def _get_tenor_delta_symbols_from_env_or_config() -> List[str]:
         symbols = list(cfg.SKEW_DATA_SYMBOLS)
     return validate_symbols(symbols)
 
+
 def collect_options_data(symbols: List[str], num_strikes: int = 10, 
                         num_expiries: int = 5, force: bool = False) -> bool:
     """
@@ -259,6 +260,7 @@ def scheduled_tenor_delta_collection():
     else:
         logging.error("Scheduled tenor-delta collection failed")
 
+
 def run_scheduler():
     """Run the scheduler for hourly data collection"""
     logging.info("Starting options data collection scheduler")
@@ -280,7 +282,7 @@ def run_scheduler():
         schedule.every().wednesday.at(hour).do(scheduled_tenor_delta_collection)
         schedule.every().thursday.at(hour).do(scheduled_tenor_delta_collection)
         schedule.every().friday.at(hour).do(scheduled_tenor_delta_collection)
-    
+
     logging.info(f"Scheduled standard collection at: {', '.join(market_hours)}")
     logging.info(f"Scheduled tenor-delta collection at: {', '.join(tenor_delta_hours)}")
     
@@ -449,7 +451,7 @@ def main():
             else:
                 logging.error("Tenor-delta data collection failed")
                 sys.exit(1)
-        
+
         # One-time collection
         success = collect_options_data(
             symbols=args.symbols,

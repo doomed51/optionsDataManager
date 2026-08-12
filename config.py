@@ -1,6 +1,8 @@
 IB_CLIENT_ID = 2
 IB_TWS_PORT = 7496
 
+UNDERLYING_PRICE_SQLITE_PATH = "F:\\workbench\\historicalData\\saveHistoricalData\\data\\historicalData_index.db"
+
 WHATTOSHOW_MAPPING = {
     "AVGO": "BID_ASK",
     "SPX": "BID_ASK",
@@ -9,12 +11,17 @@ WHATTOSHOW_MAPPING = {
 
 # symbol, strikes above the high and below the ask price of the underlying, number of expiries forward from the current date
 COLLECTION_SYMBOLS_METADATA = {
-    "SPX": {"strikes": 5, "expiries": 10},
+    "SPX": {"strikes": 10, "expiries": 10},
     "AVGO": {"strikes": 5, "expiries": 3},
 }
 
 DEFAULT_NUM_STRIKES = 5
 DEFAULT_NUM_EXPIRIES = 3
+
+# Additional underlyings collected only through ThetaData. ThetaData collection
+# always includes these symbols and the symbols in COLLECTION_SYMBOLS_METADATA.
+THETADATA_SYMBOLS = []
+THETADATA_INTERVALS = ('1m', '1h')
 
 
 

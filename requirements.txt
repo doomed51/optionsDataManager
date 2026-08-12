@@ -1,4 +1,5 @@
 ﻿pandas
+polars
 ib_insync
 psycopg2-binary
 sqlalchemy
@@ -7,3 +8,4 @@ scipy
 py_vollib
 schedule
 python-dotenv
+thetadata

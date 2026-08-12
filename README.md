@@ -75,6 +75,9 @@ DEFAULT_NUM_EXPIRIES=5
 COLLECTION_SYMBOLS=SPY,QQQ,IWM,DIA,TLT
 RISK_FREE_RATE=0.05
 
+# ThetaData historical backfill authentication
+THETADATA_API_KEY=your_thetadata_api_key
+
 # Optional tenor-delta settings
 TENOR_DELTA_SYMBOLS=SPY,QQQ
 TENOR_DELTA_MIN_INTERVAL_HOURS=1
@@ -127,6 +130,35 @@ python option_greeks_update.py --tenor-delta
 # Run tenor-delta snapshots with explicit symbols
 python option_greeks_update.py --tenor-delta --tenor-delta-symbols SPY QQQ --force
 ```
+
+### ThetaData Historical Backfill
+```python
+from datetime import date
+
+from option_data_collector import collect_thetadata_data
+
+# Backfill all available quote dates for SPX.
+collect_thetadata_data(['SPX'])
+
+# Restrict a backfill to vendor-confirmed quote dates in a date range.
+collect_thetadata_data(
+   ['SPX'],
+   start_date=date(2026, 8, 1),
+   end_date=date(2026, 8, 10),
+)
+```
+
+ThetaData uses `THETADATA_API_KEY` from `.env` and requests Polars frames. The
+backfill anchors on the earliest available ThetaData expiration and collects its
+vendor-confirmed dates. For each day, it selects the next configured expiries
+and strikes spanning the day's low through high, with the configured number of
+additional strikes on each side. Daily underlying OHLC is read first from the
+SQLite database configured by `UNDERLYING_PRICE_SQLITE_PATH` (default:
+`data/options_data.db`); missing dates are fetched from IBKR and cached in the
+existing underlying history table. It then stores `1m` and `1h` quote, OHLCV,
+open interest, implied-volatility, and first-order Greek data. Add extra
+underlyings to `THETADATA_SYMBOLS` in [config.py](config.py). ThetaData
+backfills are invoked explicitly and are not part of the collection scheduler.
 
 ### Command Line Options
 
