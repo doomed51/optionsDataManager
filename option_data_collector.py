@@ -10,11 +10,14 @@ from pathlib import Path
 import hashlib
 import os
 import sqlite3
+
+from sqlalchemy import func
 from options_data_retriever import OptionsDataRetriever
 from skew_data_collector import OptionsSkewDataCollector
 from database import (
     DatabaseManager,
     CollectionProgress,
+    ThetaDataCollectionCheckpoint,
     ContractCheckpoint,
     OptionsHistoricalData,
     UnderlyingPriceHistory,
@@ -212,7 +215,6 @@ class ThetaDataBackfillService:
                 if symbol != 'SPX':
                     continue
                 logging.info('Starting ThetaData backfill for %s', symbol)
-                # symbol = 'SPXW' if symbol == 'SPX' else symbol
 
                 metadata = cfg.COLLECTION_SYMBOLS_METADATA.get(symbol, {})
                 num_strikes = metadata.get('strikes', cfg.DEFAULT_NUM_STRIKES)
@@ -220,27 +222,48 @@ class ThetaDataBackfillService:
                 batch_id = self._batch_id(symbol, start_date, end_date)
 
                 try:
+                    # get underlying prices 
                     daily_prices = self._resolve_daily_underlying_prices(session, symbol, None, batch_id)
                     if not start_date:
                         start_date = min(daily_prices.keys()) if daily_prices else None
+
+                    # get the vendor minimum start date 
                     first_available_date = collector.first_available_backfill_date(symbol, start_date, end_date)
                     if not first_available_date:
                         logging.info('No ThetaData quote dates available for %s in the requested range.', symbol)
                         continue
 
-                    # daily_prices = self._resolve_daily_underlying_prices(session, symbol, available_dates, batch_id)
-                    # usable_dates = [trade_date for trade_date in first_available_date if trade_date in daily_prices]
-                    usable_dates = [trade_date for trade_date in daily_prices.keys() if trade_date >= first_available_date and (end_date is None or trade_date <= end_date)]
-                    usable_dates = sorted(usable_dates)
+                    # find dates that have already been backfilled 
+                    latest_touched_date = (
+                        session.query(func.max(ThetaDataCollectionCheckpoint.trade_date))
+                        .filter(
+                            ThetaDataCollectionCheckpoint.symbol == symbol,
+                            ThetaDataCollectionCheckpoint.dataset == 'full_history',
+                            ThetaDataCollectionCheckpoint.trade_date >= first_available_date,
+                            # Apply end_date here when supplied.
+                        )
+                        .scalar()
+                    )
+
+                    # set start date 
+                    backfill_start_date = latest_touched_date or first_available_date
+                    
+                    # define list of dates that need backfilling 
+                    usable_dates = sorted([
+                        trade_date 
+                        for trade_date in daily_prices.keys() 
+                        if trade_date >= backfill_start_date 
+                        and (end_date is None or trade_date <= end_date)]
+                    )
+
                     if not usable_dates:
                         logging.warning('No underlying price history is available for ThetaData %s.', symbol)
                         continue
 
+                    logging.info("Verifying endpoint availability for backfill")
                     contracts = collector.discover_contracts_for_day(
                         symbol=symbol,
                         trade_date=usable_dates[0],
-                        # high_price=daily_prices[usable_dates[0]]['high'],
-                        # low_price=daily_prices[usable_dates[0]]['low'],
                         num_strikes=num_strikes,
                         num_expiries=num_expiries,
                     )
@@ -271,16 +294,6 @@ class ThetaDataBackfillService:
                         collection_batch=batch_id,
                     )
 
-                    # print('\n', batch_id, daily_prices[usable_dates[0]]['high'], daily_prices[usable_dates[0]]['low']) 
-                    # print(first_available_date)
-                    # print(usable_dates)
-                    # print(contracts)
-                    # print('\n', batch_id, first_available_date) 
-                    # print('\n', batch_id, usable_dates) 
-                    # print('\n', batch_id, contracts) 
-                    # print('\n', availability) 
-                    print('\n', batch_id, stored_count)
-                    # exit()
                     logging.info('ThetaData %s completed: %s rows stored.', symbol, stored_count)
                     successful_symbols.append(symbol)
                 except ThetaDataEndpointUnavailable as exc:

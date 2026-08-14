@@ -321,7 +321,7 @@ class ThetaDataOptionsBackfillCollector:
         expirations = sorted(expirations_with_data[:num_expiries])
         
 
-        # determine high/low prices 
+        # determine high/low prices to establish strike bounds 
         strike_frame = self.client.option_list_strikes(symbol=symbol, expiration=expirations[0])
         strikes = sorted(strike_frame.get_column('strike').cast(pl.Float64).unique().to_list())
         middle_strike = strikes[len(strikes) // 2]
@@ -330,9 +330,6 @@ class ThetaDataOptionsBackfillCollector:
         implied_volatility = self.fetch_implied_volatility(contract, trade_date, '1m')
         high_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().max()
         low_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().min()
-        print(implied_volatility) 
-        print(high_price, low_price)
-        # exit() 
 
         contracts: List[ThetaDataContract] = []
         for expiration in expirations:
@@ -620,7 +617,7 @@ class ThetaDataOptionsBackfillCollector:
         # session.commit()
         return stored_count
 
-    def collect_contract_day(
+    def collect_contract_day(   
         self,
         session: Any,
         contract: ThetaDataContract,
@@ -650,9 +647,7 @@ class ThetaDataOptionsBackfillCollector:
         try:
             frame = self.fetch_contract_history(contract, request_date, interval)
             stored_count = self.persist_first_order_greeks(session, frame, collection_batch)
-            # print(checkpoint.id, checkpoint.symbol, checkpoint.expiry, checkpoint.strike, checkpoint.right, checkpoint.interval, checkpoint.trade_date, checkpoint.status, checkpoint.attempts, checkpoint.next_retry_at)
-            # exit() 
-            # print(frame.select('timestamp', 'expiry', 'strike', 'right', 'underlying_price', 'delta', 'implied_volatility', 'open_interest'))
+
         except ThetaDataEndpointUnavailable as exc:
             checkpoint.status = 'RETRY'
             checkpoint.last_error = str(exc)[:500]
