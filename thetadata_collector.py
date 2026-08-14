@@ -375,7 +375,7 @@ class ThetaDataOptionsBackfillCollector:
         stored_count = 0
 
         for trade_date, prices in sorted(daily_prices.items()):
-            
+            start_time = datetime.now()
             logging.info('Starting backfill for %s on %s', symbol, trade_date)
             contracts = self.discover_contracts_for_day(
                 symbol=symbol,
@@ -390,7 +390,7 @@ class ThetaDataOptionsBackfillCollector:
             
             for contract in contracts:
                 for interval in intervals:
-                    logging.info('Collecting ThetaData on %s for %s %s %s %s at interval %s', trade_date, contract.symbol, contract.expiration, contract.strike, contract.right, interval)
+                    # logging.info('Collecting ThetaData on %s for %s %s %s %s at interval %s', trade_date, contract.symbol, contract.expiration, contract.strike, contract.right, interval)
                     stored_count += self.collect_contract_day(
                         session=session,
                         contract=contract,
@@ -398,6 +398,15 @@ class ThetaDataOptionsBackfillCollector:
                         interval=interval,
                         collection_batch=collection_batch,
                     )
+
+            elapsed = datetime.now() - start_time
+            logging.info(
+                'Finished backfill for %s on %s in %s (seconds=%.2f)',
+                symbol,
+                trade_date,
+                elapsed,
+                elapsed.total_seconds(),
+            )
         return stored_count
 
     def available_quote_dates(
