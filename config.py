@@ -1,3 +1,4 @@
+from datetime import date, timedelta, datetime
 IB_CLIENT_ID = 2
 IB_TWS_PORT = 7496
 
@@ -20,8 +21,10 @@ DEFAULT_NUM_EXPIRIES = 3
 
 # Additional underlyings collected only through ThetaData. ThetaData collection
 # always includes these symbols and the symbols in COLLECTION_SYMBOLS_METADATA.
-THETADATA_SYMBOLS = []
-THETADATA_INTERVALS = ('1m', '1h')
+THETADATA_SYMBOLS = ['SPXW']
+THETADATA_INTERVALS = ('1m', '30m')
+THETADATA_MAX_LOOKBACK_YEARS = 8
+THETADATA_EARLIEST_AVILABLE_DATE = (datetime.now() - timedelta(days=THETADATA_MAX_LOOKBACK_YEARS * 365)).date().strftime('%Y-%m-%d')
 
 
 

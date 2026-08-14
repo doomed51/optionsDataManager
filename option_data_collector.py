@@ -23,51 +23,43 @@ from thetadata_collector import ThetaDataEndpointUnavailable, ThetaDataOptionsBa
 import config as cfg
 
 
-def _get_thetadata_tracked_symbols() -> List[str]:
-    """Resolve the union of standard collection and ThetaData-only symbols."""
-    # env_symbols = os.getenv('THETADATA_SYMBOLS', '').strip()
-    # theta_symbols = [symbol.strip() for symbol in env_symbols.split(',') if symbol.strip()]
-    theta_symbols = cfg.THETADATA_SYMBOLS
-    # theta_symbols.extend(cfg.THETADATA_SYMBOLS)
-    theta_symbols.extend(cfg.COLLECTION_SYMBOLS_METADATA.keys())
-    return sorted({symbol.upper() for symbol in theta_symbols if symbol.strip()})
+class ThetaDataBackfillService:
+    """Coordinate daily ThetaData option backfills and underlying-price resolution."""
 
+    def tracked_symbols(self) -> List[str]:
+        """Resolve the union of standard collection and ThetaData-only symbols."""
+        theta_symbols = list(cfg.THETADATA_SYMBOLS)
+        theta_symbols.extend(cfg.COLLECTION_SYMBOLS_METADATA.keys())
+        return sorted({symbol.upper() for symbol in theta_symbols if symbol.strip()})
 
-def _thetadata_batch_id(symbol: str, start_date: Optional[dt_date], end_date: Optional[dt_date]) -> str:
-    """Build a stable batch identifier for a ThetaData symbol/date request."""
-    value = f'thetadata:{symbol}:{start_date}:{end_date}'
-    return hashlib.md5(value.encode()).hexdigest()
+    @staticmethod
+    def _batch_id(symbol: str, start_date: Optional[dt_date], end_date: Optional[dt_date]) -> str:
+        value = f'thetadata:{symbol}:{start_date}:{end_date}'
+        return hashlib.md5(value.encode()).hexdigest()
 
+    def _load_underlying_prices_from_sqlite(
+        self,
+        symbol: str,
+        trade_dates: List[dt_date],
+    ) -> Dict[dt_date, Dict[str, float]]:
+        """Read cached daily underlying bars from the configured SQLite database."""
+        symbol = symbol.upper()
+        security_type = 'index' if symbol in cfg.INDEX_LIST else 'stock'
+        if not os.path.exists(cfg.UNDERLYING_PRICE_SQLITE_PATH):
+            return {}
 
-def _load_underlying_prices_from_sqlite(
-    symbol: str,
-    trade_dates: List[dt_date],
-) -> Dict[dt_date, Dict[str, float]]:
-    """Read cached daily underlying bars from SQLite when the local file is SQLite."""
-    symbol = symbol.upper()
-    type_ = "INDEX" if symbol in cfg.INDEX_LIST else "STOCK"
-    if not trade_dates:
-        return {}
-
-    # sqlite_path = Path(os.getenv('UNDERLYING_PRICE_SQLITE_PATH', 'data/options_data.db'))
-    sqlite_path = cfg.UNDERLYING_PRICE_SQLITE_PATH
-    if not os.path.exists(sqlite_path):
-        return {}
-
-    connection = None
-    try:
-        connection = sqlite3.connect(sqlite_path)
-        with connection:
+        table_name = f'{symbol}_{security_type}_1day'
+        connection = None
+        try:
+            connection = sqlite3.connect(cfg.UNDERLYING_PRICE_SQLITE_PATH)
             table = connection.execute(
-                f"SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{symbol}_{type_}_1day'"
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
             ).fetchone()
             if table is None:
                 return {}
 
-            columns = {
-                row[1]
-                for row in connection.execute(f'PRAGMA table_info({symbol}_{type_}_1day)').fetchall()
-            }
+            columns = {row[1] for row in connection.execute(f'PRAGMA table_info({table_name})').fetchall()}
             if not {'date', 'open', 'high', 'low'}.issubset(columns):
                 return {}
 
@@ -75,213 +67,248 @@ def _load_underlying_prices_from_sqlite(
             if close_column is None:
                 return {}
 
-            rows = connection.execute(
-                f'''SELECT date, open, high, low, {close_column} AS close
-                    FROM {symbol}_{type_}_1day
-                    WHERE symbol = ? AND date >= ? AND date < ?''',
-                (
-                    symbol,
-                    min(trade_dates).isoformat(),
-                    (max(trade_dates) + timedelta(days=1)).isoformat(),
-                ),
-            ).fetchall()
-    except sqlite3.DatabaseError as exc:
-        logging.info('Local underlying-price database is not readable as SQLite: %s', exc)
-        return {}
-    finally:
-        if connection is not None:
-            connection.close()
+            if not trade_dates:
+                rows = connection.execute(
+                    f'''SELECT date, open, high, low, {close_column} AS close
+                        FROM {table_name}''',
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    f'''SELECT date, open, high, low, {close_column} AS close
+                        FROM {table_name}
+                        WHERE date >= ? AND date < ?''',
+                    (min(trade_dates).isoformat(), (max(trade_dates) + timedelta(days=1)).isoformat()),
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            logging.info('Local underlying-price database is not readable as SQLite: %s', exc)
+            return {}
+        finally:
+            if connection is not None:
+                connection.close()
 
-    requested_dates = set(trade_dates)
-    prices: Dict[dt_date, Dict[str, float]] = {}
-    for row_date, open_price, high_price, low_price, close_price in rows:
-        parsed_date = pd.to_datetime(row_date).date()
-        if parsed_date not in requested_dates or high_price is None or low_price is None:
-            continue
-        prices[parsed_date] = {
-            'open': float(open_price) if open_price is not None else None,
-            'high': float(high_price),
-            'low': float(low_price),
-            'close': float(close_price) if close_price is not None else None,
-        }
-    return prices
-
-
-def _fetch_underlying_prices_from_ibkr(
-    symbol: str,
-    trade_dates: List[dt_date],
-) -> Dict[dt_date, Dict[str, float]]:
-    """Fetch the missing daily underlying bars through the existing IBKR collector path."""
-    if not trade_dates:
-        return {}
-
-    ib = IB()
-    collector = None
-    try:
-        ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
-        collector = OptionsDataCollector(ib)
-        frame = collector.get_underlying_price_history(
-            symbol=symbol,
-            start_date=datetime.combine(min(trade_dates), datetime.min.time()),
-            end_date=datetime.combine(max(trade_dates), datetime.min.time()),
-        )
-    finally:
-        if collector is not None:
-            collector.close()
-        if ib.isConnected():
-            ib.disconnect()
-
-    requested_dates = set(trade_dates)
-    prices: Dict[dt_date, Dict[str, float]] = {}
-    for _, row in frame.iterrows():
-        trade_date = pd.to_datetime(row['date']).date()
-        if trade_date not in requested_dates or pd.isna(row['high']) or pd.isna(row['low']):
-            continue
-        prices[trade_date] = {
-            'open': float(row['open']) if not pd.isna(row['open']) else None,
-            'high': float(row['high']),
-            'low': float(row['low']),
-            'close': float(row['close']) if not pd.isna(row['close']) else None,
-        }
-    return prices
-
-
-def _persist_underlying_prices(
-    session,
-    symbol: str,
-    prices: Dict[dt_date, Dict[str, float]],
-    collection_batch: str,
-) -> None:
-    """Cache newly fetched daily bars in the existing underlying-history table."""
-    for trade_date, values in prices.items():
-        row_date = datetime.combine(trade_date, datetime.min.time())
-        exists = session.query(UnderlyingPriceHistory.id).filter_by(symbol=symbol, date=row_date).first()
-        if exists is not None:
-            continue
-        session.add(
-            UnderlyingPriceHistory(
-                symbol=symbol,
-                date=row_date,
-                open=values.get('open'),
-                high=values.get('high'),
-                low=values.get('low'),
-                price=values.get('close'),
-                collection_batch=collection_batch,
-            )
-        )
-    session.commit()
-
-
-def _resolve_daily_underlying_prices(
-    session,
-    symbol: str,
-    trade_dates: List[dt_date],
-    collection_batch: str,
-) -> Dict[dt_date, Dict[str, float]]:
-    """Use SQLite daily bars first, then fetch and cache only missing IBKR dates."""
-    prices = _load_underlying_prices_from_sqlite(symbol, trade_dates)
-    missing_dates = [trade_date for trade_date in trade_dates if trade_date not in prices]
-    if not missing_dates:
+        requested_dates = set(trade_dates) if trade_dates else None 
+        prices: Dict[dt_date, Dict[str, float]] = {}
+        for row_date, open_price, high_price, low_price, close_price in rows:
+            parsed_date = pd.to_datetime(row_date).date()
+            if (requested_dates and parsed_date not in requested_dates) or high_price is None or low_price is None:
+                continue
+            prices[parsed_date] = {
+                'open': float(open_price) if open_price is not None else None,
+                'high': float(high_price),
+                'low': float(low_price),
+                'close': float(close_price) if close_price is not None else None,
+            }
         return prices
 
-    fetched_prices = _fetch_underlying_prices_from_ibkr(symbol, missing_dates)
-    _persist_underlying_prices(session, symbol, fetched_prices, collection_batch)
-    prices.update(fetched_prices)
-    return prices
+    def _fetch_underlying_prices_from_ibkr(
+        self,
+        symbol: str,
+        trade_dates: List[dt_date],
+    ) -> Dict[dt_date, Dict[str, float]]:
+        """Fetch missing daily underlying bars through the existing IBKR collector path."""
+        if not trade_dates:
+            return {}
+
+        ib = IB()
+        collector = None
+        try:
+            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
+            collector = OptionsDataCollector(ib)
+            frame = collector.get_underlying_price_history(
+                symbol=symbol,
+                start_date=datetime.combine(min(trade_dates), datetime.min.time()),
+                end_date=datetime.combine(max(trade_dates), datetime.min.time()),
+            )
+        finally:
+            if collector is not None:
+                collector.close()
+            if ib.isConnected():
+                ib.disconnect()
+
+        requested_dates = set(trade_dates)
+        prices: Dict[dt_date, Dict[str, float]] = {}
+        for _, row in frame.iterrows():
+            trade_date = pd.to_datetime(row['date']).date()
+            if trade_date not in requested_dates or pd.isna(row['high']) or pd.isna(row['low']):
+                continue
+            prices[trade_date] = {
+                'open': float(row['open']) if not pd.isna(row['open']) else None,
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'close': float(row['close']) if not pd.isna(row['close']) else None,
+            }
+        return prices
+
+    @staticmethod
+    def _persist_underlying_prices(session, symbol: str, prices: Dict[dt_date, Dict[str, float]], collection_batch: str) -> None:
+        """Cache newly fetched daily bars in the existing underlying-history table."""
+        for trade_date, values in prices.items():
+            row_date = datetime.combine(trade_date, datetime.min.time())
+            exists = session.query(UnderlyingPriceHistory.id).filter_by(symbol=symbol, date=row_date).first()
+            if exists is not None:
+                continue
+            session.add(
+                UnderlyingPriceHistory(
+                    symbol=symbol,
+                    date=row_date,
+                    open=values.get('open'),
+                    high=values.get('high'),
+                    low=values.get('low'),
+                    price=values.get('close'),
+                    collection_batch=collection_batch,
+                )
+            )
+        session.commit()
+
+    def _resolve_daily_underlying_prices(
+        self,
+        session,
+        symbol: str,
+        trade_dates: List[dt_date],
+        collection_batch: str,
+    ) -> Dict[dt_date, Dict[str, float]]:
+        """Use SQLite daily bars first, then fetch and cache only missing IBKR dates."""
+        symbol = 'SPX' if symbol == 'SPXW' else symbol 
+        prices = self._load_underlying_prices_from_sqlite(symbol, trade_dates)
+        
+        if not trade_dates:
+            return prices
+
+        missing_dates = [trade_date for trade_date in trade_dates if trade_date not in prices]
+        if not missing_dates:
+            return prices
+        
+        logging.warning('%d missing underlying prices for %s, fetching from IBKR', len(missing_dates), symbol)
+        fetched_prices = self._fetch_underlying_prices_from_ibkr(symbol, missing_dates)
+        
+        # self._persist_underlying_prices(session, symbol, fetched_prices, collection_batch)
+        prices.update(fetched_prices)
+        return prices
+
+    def collect(
+        self,
+        symbols: Optional[List[str]] = None,
+        start_date: Optional[dt_date] = None,
+        end_date: Optional[dt_date] = None,
+    ) -> bool:
+        """Backfill ThetaData contracts selected from each day's underlying high and low."""
+        db_manager = None
+        session = None
+        try:
+            requested_symbols = symbols if symbols is not None else self.tracked_symbols()
+            normalized_symbols = sorted({symbol.upper().strip() for symbol in requested_symbols if symbol.strip()})
+            if not normalized_symbols:
+                logging.error('No valid ThetaData symbols provided')
+                return False
+
+
+            collector = ThetaDataOptionsBackfillCollector()
+            db_manager = DatabaseManager()
+            db_manager.create_tables()
+            session = db_manager.get_session()
+            successful_symbols = []
+
+            for symbol in normalized_symbols:
+                if symbol != 'SPX':
+                    continue
+                logging.info('Starting ThetaData backfill for %s', symbol)
+                # symbol = 'SPXW' if symbol == 'SPX' else symbol
+
+                metadata = cfg.COLLECTION_SYMBOLS_METADATA.get(symbol, {})
+                num_strikes = metadata.get('strikes', cfg.DEFAULT_NUM_STRIKES)
+                num_expiries = metadata.get('expiries', cfg.DEFAULT_NUM_EXPIRIES)
+                batch_id = self._batch_id(symbol, start_date, end_date)
+
+                try:
+                    daily_prices = self._resolve_daily_underlying_prices(session, symbol, None, batch_id)
+                    if not start_date:
+                        start_date = min(daily_prices.keys()) if daily_prices else None
+                    first_available_date = collector.first_available_backfill_date(symbol, start_date, end_date)
+                    if not first_available_date:
+                        logging.info('No ThetaData quote dates available for %s in the requested range.', symbol)
+                        continue
+
+                    # daily_prices = self._resolve_daily_underlying_prices(session, symbol, available_dates, batch_id)
+                    # usable_dates = [trade_date for trade_date in first_available_date if trade_date in daily_prices]
+                    usable_dates = [trade_date for trade_date in daily_prices.keys() if trade_date >= first_available_date and (end_date is None or trade_date <= end_date)]
+                    usable_dates = sorted(usable_dates)
+                    if not usable_dates:
+                        logging.warning('No underlying price history is available for ThetaData %s.', symbol)
+                        continue
+
+                    contracts = collector.discover_contracts_for_day(
+                        symbol=symbol,
+                        trade_date=usable_dates[0],
+                        # high_price=daily_prices[usable_dates[0]]['high'],
+                        # low_price=daily_prices[usable_dates[0]]['low'],
+                        num_strikes=num_strikes,
+                        num_expiries=num_expiries,
+                    )
+                    if not contracts:
+                        logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, usable_dates[0])
+                        continue
+
+
+                    availability = collector.preflight(contracts[0], usable_dates[0])
+                    if not availability.available:
+                        collector.record_endpoint_unavailable(
+                            session=session,
+                            symbol=symbol,
+                            endpoint=availability.endpoint or 'unknown',
+                            reason=availability.reason or 'ThetaData endpoint unavailable',
+                        )
+                        logging.error('ThetaData unavailable for %s: %s', symbol, availability.reason)
+                        continue
+
+                    logging.info('Starting ThetaData backfill for %s: %d usable dates from %s to %s', symbol, len(usable_dates), usable_dates[0], usable_dates[-1])
+                    stored_count = collector.backfill_daily_subsets(
+                        session=session,
+                        symbol=symbol,
+                        daily_prices={trade_date: daily_prices[trade_date] for trade_date in usable_dates},
+                        num_strikes=num_strikes,
+                        num_expiries=num_expiries,
+                        intervals=list(cfg.THETADATA_INTERVALS),
+                        collection_batch=batch_id,
+                    )
+
+                    # print('\n', batch_id, daily_prices[usable_dates[0]]['high'], daily_prices[usable_dates[0]]['low']) 
+                    # print(first_available_date)
+                    # print(usable_dates)
+                    # print(contracts)
+                    # print('\n', batch_id, first_available_date) 
+                    # print('\n', batch_id, usable_dates) 
+                    # print('\n', batch_id, contracts) 
+                    # print('\n', availability) 
+                    print('\n', batch_id, stored_count)
+                    # exit()
+                    logging.info('ThetaData %s completed: %s rows stored.', symbol, stored_count)
+                    successful_symbols.append(symbol)
+                except ThetaDataEndpointUnavailable as exc:
+                    collector.record_endpoint_unavailable(session, symbol, 'backfill', str(exc))
+                    logging.error('ThetaData unavailable for %s: %s', symbol, exc)
+                except Exception as exc:
+                    logging.error('ThetaData backfill failed for %s: %s', symbol, exc)
+
+            return bool(successful_symbols)
+        except ThetaDataEndpointUnavailable as exc:
+            logging.error('ThetaData initialization failed: %s', exc)
+            return False
+        finally:
+            if session is not None:
+                session.close()
+            if db_manager is not None:
+                db_manager.close()
 
 
 def collect_thetadata_data(
-    symbols: List[str],
+    symbols: Optional[List[str]] = None,
     start_date: Optional[dt_date] = None,
     end_date: Optional[dt_date] = None,
 ) -> bool:
-    """Backfill ThetaData contracts selected from each day's underlying high and low."""
-    db_manager = None
-    session = None
-    try:
-        normalized_symbols = sorted({symbol.upper().strip() for symbol in symbols if symbol.strip()})
-        if not normalized_symbols:
-            logging.error('No valid ThetaData symbols provided')
-            return False
+    """Run the ThetaData backfill service for explicit or configured symbols."""
+    return ThetaDataBackfillService().collect(symbols, start_date, end_date)
 
-        collector = ThetaDataOptionsBackfillCollector()
-        db_manager = DatabaseManager()
-        db_manager.create_tables()
-        session = db_manager.get_session()
-        successful_symbols = []
 
-        for symbol in normalized_symbols:
-            metadata = cfg.COLLECTION_SYMBOLS_METADATA.get(symbol, {})
-            num_strikes = metadata.get('strikes', cfg.DEFAULT_NUM_STRIKES)
-            num_expiries = metadata.get('expiries', cfg.DEFAULT_NUM_EXPIRIES)
-            batch_id = _thetadata_batch_id(symbol, start_date, end_date)
-
-            try:
-                available_dates = collector.available_backfill_dates(symbol, start_date, end_date)
-                if not available_dates:
-                    logging.info('No ThetaData quote dates available for %s in the requested range.', symbol)
-                    continue
-
-                daily_prices = _resolve_daily_underlying_prices(
-                    session=session,
-                    symbol=symbol,
-                    trade_dates=available_dates,
-                    collection_batch=batch_id,
-                )
-                usable_dates = [trade_date for trade_date in available_dates if trade_date in daily_prices]
-                if not usable_dates:
-                    logging.warning('No underlying price history is available for ThetaData %s.', symbol)
-                    continue
-
-                contracts = collector.discover_contracts_for_day(
-                    symbol=symbol,
-                    trade_date=usable_dates[0],
-                    high_price=daily_prices[usable_dates[0]]['high'],
-                    low_price=daily_prices[usable_dates[0]]['low'],
-                    num_strikes=num_strikes,
-                    num_expiries=num_expiries,
-                )
-                if not contracts:
-                    logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, usable_dates[0])
-                    continue
-
-                availability = collector.preflight(contracts[0], usable_dates[0])
-                if not availability.available:
-                    collector.record_endpoint_unavailable(
-                        session=session,
-                        symbol=symbol,
-                        endpoint=availability.endpoint or 'unknown',
-                        reason=availability.reason or 'ThetaData endpoint unavailable',
-                    )
-                    logging.error('ThetaData unavailable for %s: %s', symbol, availability.reason)
-                    continue
-
-                stored_count = collector.backfill_daily_subsets(
-                    session=session,
-                    symbol=symbol,
-                    daily_prices={trade_date: daily_prices[trade_date] for trade_date in usable_dates},
-                    num_strikes=num_strikes,
-                    num_expiries=num_expiries,
-                    intervals=list(cfg.THETADATA_INTERVALS),
-                    collection_batch=batch_id,
-                )
-                logging.info('ThetaData %s completed: %s rows stored.', symbol, stored_count)
-                successful_symbols.append(symbol)
-            except ThetaDataEndpointUnavailable as exc:
-                collector.record_endpoint_unavailable(session, symbol, 'backfill', str(exc))
-                logging.error('ThetaData unavailable for %s: %s', symbol, exc)
-            except Exception as exc:
-                logging.error('ThetaData backfill failed for %s: %s', symbol, exc)
-
-        return bool(successful_symbols)
-    except ThetaDataEndpointUnavailable as exc:
-        logging.error('ThetaData initialization failed: %s', exc)
-        return False
-    finally:
-        if session is not None:
-            session.close()
-        if db_manager is not None:
-            db_manager.close()
 
 class OptionsDataCollector:
     def __init__(self, ib_connection: IB, checkpoint_dir: str = "checkpoints"):
@@ -1353,111 +1380,113 @@ def main():
         datefmt='%H:%M:%S'
     )
 
-    skew_schedule = [
-        ('10:00', time(10, 0)),
-        ('12:00', time(12, 0)),
-        ('14:00', time(14, 0)),
-    ]
-    regular_run_time = time(16, 15)
+    print( collect_thetadata_data() )
 
-    today = datetime.now().date()
-    if today.weekday() > 4:
-        logging.info("Weekend detected; scheduler only runs Monday through Friday. Exiting.")
-        return
+    # skew_schedule = [
+    #     ('10:00', time(10, 0)),
+    #     ('12:00', time(12, 0)),
+    #     ('14:00', time(14, 0)),
+    # ]
+    # regular_run_time = time(16, 15)
 
-    skew_done = {label: False for label, _ in skew_schedule}
-    regular_done = False
+    # today = datetime.now().date()
+    # if today.weekday() > 4:
+    #     logging.info("Weekend detected; scheduler only runs Monday through Friday. Exiting.")
+    #     return
 
-    def run_skew_collection_once() -> None:
-        ib = IB()
-        skew_collector = None
-        try:
-            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
-            skew_collector = OptionsSkewDataCollector(ib)
-            skew_data = skew_collector.collect_skew_data(
-                symbols=cfg.SKEW_DATA_SYMBOLS,
-                force=True,
-            )
-            logging.info(f"Skew collection completed with results: {skew_data}")
-        finally:
-            if skew_collector is not None:
-                skew_collector.close()
-            if ib.isConnected():
-                ib.disconnect()
+    # skew_done = {label: False for label, _ in skew_schedule}
+    # regular_done = False
 
-    def run_regular_collection_once() -> None:
-        ib = IB()
-        collector = None
-        try:
-            ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
-            collector = OptionsDataCollector(ib)
+    # def run_skew_collection_once() -> None:
+    #     ib = IB()
+    #     skew_collector = None
+    #     try:
+    #         ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
+    #         skew_collector = OptionsSkewDataCollector(ib)
+    #         skew_data = skew_collector.collect_skew_data(
+    #             symbols=cfg.SKEW_DATA_SYMBOLS,
+    #             force=True,
+    #         )
+    #         logging.info(f"Skew collection completed with results: {skew_data}")
+    #     finally:
+    #         if skew_collector is not None:
+    #             skew_collector.close()
+    #         if ib.isConnected():
+    #             ib.disconnect()
 
-            start_date = datetime.now() - timedelta(days=1)
-            end_date = datetime.now()
-            if end_date.weekday() == 6:
-                start_date = datetime.now() - timedelta(days=2)
+    # def run_regular_collection_once() -> None:
+    #     ib = IB()
+    #     collector = None
+    #     try:
+    #         ib.connect('127.0.0.1', cfg.IB_TWS_PORT, clientId=cfg.IB_CLIENT_ID)
+    #         collector = OptionsDataCollector(ib)
 
-            if start_date.date() == end_date.date():
-                logging.info("Regular collection skipped because start and end dates are the same")
-                return
+    #         start_date = datetime.now() - timedelta(days=1)
+    #         end_date = datetime.now()
+    #         if end_date.weekday() == 6:
+    #             start_date = datetime.now() - timedelta(days=2)
 
-            for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
-                collector.collect_and_store_data(
-                    key,
-                    start_date.date(),
-                    end_date,
-                    num_strikes=values.get('strikes', cfg.DEFAULT_NUM_STRIKES),
-                    num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
-                    bar_size='1 min'
-                )
-            logging.info("Regular data collection completed")
-        finally:
-            if collector is not None:
-                collector.close()
-            if ib.isConnected():
-                ib.disconnect()
+    #         if start_date.date() == end_date.date():
+    #             logging.info("Regular collection skipped because start and end dates are the same")
+    #             return
 
-    logging.info("Daily scheduler started. Waiting for 10:00, 12:00, 14:00 skew runs and 16:15 regular run.")
+    #         for key, values in cfg.COLLECTION_SYMBOLS_METADATA.items():
+    #             collector.collect_and_store_data(
+    #                 key,
+    #                 start_date.date(),
+    #                 end_date,
+    #                 num_strikes=values.get('strikes', cfg.DEFAULT_NUM_STRIKES),
+    #                 num_expiries=values.get('expiries', cfg.DEFAULT_NUM_EXPIRIES),
+    #                 bar_size='1 min'
+    #             )
+    #         logging.info("Regular data collection completed")
+    #     finally:
+    #         if collector is not None:
+    #             collector.close()
+    #         if ib.isConnected():
+    #             ib.disconnect()
 
-    while True:
-        now = datetime.now()
+    # logging.info("Daily scheduler started. Waiting for 10:00, 12:00, 14:00 skew runs and 16:15 regular run.")
 
-        if now.date() != today:
-            logging.info("Date changed before schedule completion. Exiting to avoid cross-day runs.")
-            return
+    # while True:
+    #     now = datetime.now()
 
-        if now.weekday() > 4:
-            logging.info("Weekend reached; exiting scheduler.")
-            return
+    #     if now.date() != today:
+    #         logging.info("Date changed before schedule completion. Exiting to avoid cross-day runs.")
+    #         return
 
-        current_time = now.time()
+    #     if now.weekday() > 4:
+    #         logging.info("Weekend reached; exiting scheduler.")
+    #         return
 
-        for slot_label, slot_time in skew_schedule:
-            if skew_done[slot_label]:
-                continue
-            if current_time >= slot_time:
-                logging.info(f"Triggering skew collection for {slot_label} slot at {current_time}")
-                try:
-                    run_skew_collection_once()
-                except Exception as e:
-                    logging.error(f"Skew collection failed for {slot_label}: {e}")
-                finally:
-                    skew_done[slot_label] = True
+    #     current_time = now.time()
 
-        if (not regular_done) and current_time >= regular_run_time:
-            logging.info(f"Triggering regular collection at {current_time}")
-            try:
-                run_regular_collection_once()
-            except Exception as e:
-                logging.error(f"Regular collection failed: {e}")
-            finally:
-                regular_done = True
+    #     for slot_label, slot_time in skew_schedule:
+    #         if skew_done[slot_label]:
+    #             continue
+    #         if current_time >= slot_time:
+    #             logging.info(f"Triggering skew collection for {slot_label} slot at {current_time}")
+    #             try:
+    #                 run_skew_collection_once()
+    #             except Exception as e:
+    #                 logging.error(f"Skew collection failed for {slot_label}: {e}")
+    #             finally:
+    #                 skew_done[slot_label] = True
 
-        if all(skew_done.values()) and regular_done:
-            logging.info("All scheduled runs have been attempted once. Exiting.")
-            return
+    #     if (not regular_done) and current_time >= regular_run_time:
+    #         logging.info(f"Triggering regular collection at {current_time}")
+    #         try:
+    #             run_regular_collection_once()
+    #         except Exception as e:
+    #             logging.error(f"Regular collection failed: {e}")
+    #         finally:
+    #             regular_done = True
 
-        time_.sleep(30)
+    #     if all(skew_done.values()) and regular_done:
+    #         logging.info("All scheduled runs have been attempted once. Exiting.")
+    #         return
+
+    #     time_.sleep(30)
 
 
 

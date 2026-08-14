@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from database import Base, ThetaDataCollectionCheckpoint, ThetaDataOptionHistory
-from option_data_collector import _load_underlying_prices_from_sqlite
+from option_data_collector import ThetaDataBackfillService
 from thetadata_collector import ThetaDataContract, ThetaDataOptionsBackfillCollector
 
 
@@ -218,7 +218,7 @@ class ThetaDataOptionsBackfillCollectorTests(unittest.TestCase):
         client = FakeThetaClient()
         collector = ThetaDataOptionsBackfillCollector(client=client)
 
-        dates = collector.available_backfill_dates('SPX')
+        dates = collector.first_available_backfill_date('SPX')
 
         self.assertEqual(dates[0], date(2026, 8, 7))
         _, request = client.calls[-1]
@@ -460,20 +460,23 @@ class ThetaDataOptionsBackfillCollectorTests(unittest.TestCase):
             connection = sqlite3.connect(sqlite_path)
             try:
                 connection.execute(
-                    '''CREATE TABLE underlying_price_history (
-                        symbol TEXT, date TEXT, open REAL, high REAL, low REAL, price REAL
+                    '''CREATE TABLE SPX_INDEX_1day (
+                        date TEXT, open REAL, high REAL, low REAL, price REAL
                     )'''
                 )
                 connection.execute(
-                    '''INSERT INTO underlying_price_history
-                    VALUES ('SPX', '2026-08-10 00:00:00', 6490, 6510, 6480, 6500)'''
+                    '''INSERT INTO SPX_INDEX_1day
+                    VALUES ('2026-08-10 00:00:00', 6490, 6510, 6480, 6500)'''
                 )
                 connection.commit()
             finally:
                 connection.close()
 
-            with patch.dict('os.environ', {'UNDERLYING_PRICE_SQLITE_PATH': str(sqlite_path)}, clear=False):
-                prices = _load_underlying_prices_from_sqlite('SPX', [date(2026, 8, 10)])
+            with patch('option_data_collector.cfg.UNDERLYING_PRICE_SQLITE_PATH', str(sqlite_path)):
+                prices = ThetaDataBackfillService()._load_underlying_prices_from_sqlite(
+                    'SPX',
+                    [date(2026, 8, 10)],
+                )
 
         self.assertEqual(
             prices,

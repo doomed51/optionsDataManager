@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 from thetadata import ThetaClient
 
 import polars as pl
+import config as cfg
 
 from database import ThetaDataCollectionCheckpoint, ThetaDataOptionHistory
 
@@ -99,6 +100,7 @@ class ThetaDataOptionsBackfillCollector:
     def __init__(self, client: Optional[Any] = None, client_factory: Optional[Callable[..., Any]] = None):
         self.client = client or self._create_client(client_factory)
         self._validate_client_methods()
+        self.AVAILABLE_DATES_BY_EXPIRATION_CACHE: Dict[str, List[date]] = {}
 
     @staticmethod
     def _create_client(client_factory: Optional[Callable[..., Any]]) -> Any:
@@ -186,15 +188,19 @@ class ThetaDataOptionsBackfillCollector:
                 )
         return contracts
 
-    def available_backfill_dates(
+    def first_available_backfill_date(
         self,
         symbol: str,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
-    ) -> List[date]:
+    ) -> date:
         """Return vendor-confirmed dates from the earliest available expiration."""
         try:
             expiration_frame = self.client.option_list_expirations(symbol=symbol)
+            # truncate to earliest available date 
+            cutoffdate = date.fromisoformat(cfg.THETADATA_EARLIEST_AVILABLE_DATE) if not start_date else max(date.fromisoformat(cfg.THETADATA_EARLIEST_AVILABLE_DATE), start_date)
+            expiration_frame = expiration_frame.filter(pl.col('expiration').cast(pl.Date) >= cutoffdate)
+
         except Exception as exc:
             raise ThetaDataEndpointUnavailable(
                 f"option_list_expirations unavailable: {self._safe_error(exc)}"
@@ -204,8 +210,10 @@ class ThetaDataOptionsBackfillCollector:
             raise ThetaDataEndpointUnavailable('option_list_expirations returned an invalid Polars schema.')
 
         expirations = sorted(expiration_frame.get_column('expiration').cast(pl.Date).unique().to_list())
+
         if not expirations:
             return []
+
 
         try:
             date_frame = self.client.option_list_dates(
@@ -223,25 +231,58 @@ class ThetaDataOptionsBackfillCollector:
         if not isinstance(date_frame, pl.DataFrame) or 'date' not in date_frame.columns:
             raise ThetaDataEndpointUnavailable('option_list_dates returned an invalid Polars schema.')
 
-        return [
-            available_date
-            for available_date in sorted(date_frame.get_column('date').cast(pl.Date).unique().to_list())
-            if (start_date is None or available_date >= start_date)
-            and (end_date is None or available_date <= end_date)
-        ]
+        # truncate to earliest available date
+        date_frame = date_frame.filter(pl.col('date').cast(pl.Date) >= cutoffdate)
+
+        # return [
+        #     available_date
+        #     for available_date in sorted(date_frame.get_column('date').cast(pl.Date).unique().to_list())
+        #     if (start_date is None or available_date >= start_date)
+        #     and (end_date is None or available_date <= end_date)
+        # ]
+        return date_frame.drop_nans().drop_nulls().get_column('date').cast(pl.Date).min()
+
+    def _check_and_update_available_dates_cache(
+        self,
+        symbol: str,
+        expiration: date,
+    ) -> List[date]:
+        """Check the cache for available dates, and update it if necessary."""
+        cache_key = f"{symbol}_{expiration.isoformat()}"
+        if cache_key in self.AVAILABLE_DATES_BY_EXPIRATION_CACHE:
+            return self.AVAILABLE_DATES_BY_EXPIRATION_CACHE[cache_key]
+
+        try:
+            # date_frame = self.client.option_list_dates(
+            #     request_type='quote',
+            #     symbol=symbol,
+            #     expiration=expiration,
+            #     strike='*',
+            #     right='both',
+            # )
+            # available_dates = date_frame.drop_nans().drop_nulls().get_column('date').cast(pl.Date).to_list()
+            available_dates = self.available_quote_dates(symbol=symbol, expiration=expiration)
+            self.AVAILABLE_DATES_BY_EXPIRATION_CACHE[cache_key] = available_dates
+            return available_dates
+        except Exception as exc:
+            raise ThetaDataEndpointUnavailable(
+                f"option_list_dates unavailable: {self._safe_error(exc)}"
+            ) from exc
 
     def discover_contracts_for_day(
         self,
         symbol: str,
         trade_date: date,
-        high_price: float,
-        low_price: float,
+        # high_price: float,
+        # low_price: float,
         num_strikes: int,
         num_expiries: int,
     ) -> List[ThetaDataContract]:
         """Select the next expiries and strike wings for one underlying trading day."""
+        logging.debug('Discovering ThetaData contracts for %s on %s', symbol, trade_date)
         try:
             expiration_frame = self.client.option_list_expirations(symbol=symbol)
+            expiration_frame = expiration_frame.filter(pl.col('expiration').cast(pl.Date) >= trade_date)
         except Exception as exc:
             raise ThetaDataEndpointUnavailable(
                 f"option_list_expirations unavailable: {self._safe_error(exc)}"
@@ -253,8 +294,46 @@ class ThetaDataOptionsBackfillCollector:
         expirations = [
             expiration
             for expiration in sorted(expiration_frame.get_column('expiration').cast(pl.Date).unique().to_list())
-            if expiration >= trade_date
-        ][:num_expiries]
+        ]#[:num_expiries]
+
+        # check if vendor has data for the target date and expiry
+        expirations_with_data = [] 
+        logging.debug('Checking available data for expirations for %s on %s', symbol, trade_date)
+        for exp in sorted(expirations): 
+            try:
+                available_dates = self._check_and_update_available_dates_cache(symbol=symbol, expiration=exp)
+                if trade_date in available_dates:
+                    expirations_with_data.append(exp)
+
+                if len(expirations_with_data) >= num_expiries:
+                    break
+            except Exception as exc:
+                raise ThetaDataEndpointUnavailable(
+                    f"Error checking available dates: {self._safe_error(exc)}"
+                ) from exc
+
+        if len(expirations_with_data) == 0:
+            logging.warning('No expirations with available data for %s on %s', symbol, trade_date)
+            exit() 
+            return None 
+        
+        logging.debug('Found %d expirations with available data for %s on %s', len(expirations_with_data), symbol, trade_date)
+        expirations = sorted(expirations_with_data[:num_expiries])
+        
+
+        # determine high/low prices 
+        strike_frame = self.client.option_list_strikes(symbol=symbol, expiration=expirations[0])
+        strikes = sorted(strike_frame.get_column('strike').cast(pl.Float64).unique().to_list())
+        middle_strike = strikes[len(strikes) // 2]
+        contract = ThetaDataContract(symbol, expirations[0], middle_strike, 'C')
+
+        implied_volatility = self.fetch_implied_volatility(contract, trade_date, '1m')
+        high_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().max()
+        low_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().min()
+        print(implied_volatility) 
+        print(high_price, low_price)
+        # exit() 
+
         contracts: List[ThetaDataContract] = []
         for expiration in expirations:
             try:
@@ -275,6 +354,7 @@ class ThetaDataOptionsBackfillCollector:
             high_index = min(range(len(strikes)), key=lambda index: abs(strikes[index] - high_price))
             start_index = max(0, low_index - num_strikes)
             end_index = min(len(strikes), high_index + num_strikes + 1)
+            
             for strike in strikes[start_index:end_index]:
                 contracts.extend(
                     [
@@ -296,23 +376,24 @@ class ThetaDataOptionsBackfillCollector:
     ) -> int:
         """Backfill contracts selected independently for every vendor-confirmed day."""
         stored_count = 0
-        for trade_date, prices in sorted(daily_prices.items()):
-            high_price = prices.get('high')
-            low_price = prices.get('low')
-            if high_price is None or low_price is None:
-                logger.warning('Skipping ThetaData %s on %s: underlying high/low is unavailable.', symbol, trade_date)
-                continue
 
+        for trade_date, prices in sorted(daily_prices.items()):
+            
+            logging.info('Starting backfill for %s on %s', symbol, trade_date)
             contracts = self.discover_contracts_for_day(
                 symbol=symbol,
                 trade_date=trade_date,
-                high_price=float(high_price),
-                low_price=float(low_price),
                 num_strikes=num_strikes,
                 num_expiries=num_expiries,
             )
+
+            if not contracts: 
+                logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, trade_date)
+                continue
+            
             for contract in contracts:
                 for interval in intervals:
+                    logging.info('Collecting ThetaData on %s for %s %s %s %s at interval %s', trade_date, contract.symbol, contract.expiration, contract.strike, contract.right, interval)
                     stored_count += self.collect_contract_day(
                         session=session,
                         contract=contract,
@@ -324,19 +405,27 @@ class ThetaDataOptionsBackfillCollector:
 
     def available_quote_dates(
         self,
-        contract: ThetaDataContract,
+        # contract: ThetaDataContract,
+        symbol: str,
+        expiration: date,
+        request_type: str = 'quote',
+        strike: int = '*',
+        right: str = 'both',
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
     ) -> List[date]:
         """Return actual available quote dates for a contract, optionally bounded by callers."""
         try:
             date_frame = self.client.option_list_dates(
-                request_type='quote',
-                symbol=contract.symbol,
-                expiration=contract.expiration,
-                strike=f'{contract.strike:.6f}',
-                right=contract.endpoint_right(),
+                request_type=request_type,
+                symbol=symbol,
+                expiration=expiration,
+                strike=strike,
+                right=right,
             )
+
+            # truncate to earliest available date
+            date_frame = date_frame.filter(pl.col('date').cast(pl.Date) >= date.fromisoformat(cfg.THETADATA_EARLIEST_AVILABLE_DATE))
         except Exception as exc:
             raise ThetaDataEndpointUnavailable(
                 f"option_list_dates unavailable: {self._safe_error(exc)}"
@@ -527,7 +616,8 @@ class ThetaDataOptionsBackfillCollector:
             existing.collection_batch = collection_batch
             stored_count += 1
 
-        session.commit()
+        
+        # session.commit()
         return stored_count
 
     def collect_contract_day(
@@ -547,6 +637,7 @@ class ThetaDataOptionsBackfillCollector:
             collection_batch=collection_batch,
         )
         if checkpoint.status == 'COMPLETE':
+            logging.info('ThetaData already collected for %s on %s at interval %s', contract.symbol, request_date, interval)
             return 0
         if checkpoint.next_retry_at is not None and checkpoint.next_retry_at > datetime.now():
             return 0
@@ -554,11 +645,14 @@ class ThetaDataOptionsBackfillCollector:
         checkpoint.status = 'IN_PROGRESS'
         checkpoint.attempts = (checkpoint.attempts or 0) + 1
         checkpoint.next_retry_at = None
-        session.commit()
+        # session.commit()
 
         try:
             frame = self.fetch_contract_history(contract, request_date, interval)
             stored_count = self.persist_first_order_greeks(session, frame, collection_batch)
+            # print(checkpoint.id, checkpoint.symbol, checkpoint.expiry, checkpoint.strike, checkpoint.right, checkpoint.interval, checkpoint.trade_date, checkpoint.status, checkpoint.attempts, checkpoint.next_retry_at)
+            # exit() 
+            # print(frame.select('timestamp', 'expiry', 'strike', 'right', 'underlying_price', 'delta', 'implied_volatility', 'open_interest'))
         except ThetaDataEndpointUnavailable as exc:
             checkpoint.status = 'RETRY'
             checkpoint.last_error = str(exc)[:500]
@@ -667,6 +761,8 @@ class ThetaDataOptionsBackfillCollector:
         }
         if method_name != self.REQUIRED_ENDPOINTS['open_interest']:
             parameters['interval'] = interval
+        if method_name == self.REQUIRED_ENDPOINTS['implied_volatility']:
+            parameters['version'] = 'latest'
 
         try:
             result = method(**parameters)
