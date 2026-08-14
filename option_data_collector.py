@@ -259,6 +259,7 @@ class ThetaDataBackfillService:
                     if not usable_dates:
                         logging.warning('No underlying price history is available for ThetaData %s.', symbol)
                         continue
+                    logging.info('ThetaData backfill for %s will process %d dates from %s to %s', symbol, len(usable_dates), usable_dates[0], usable_dates[-1])
 
                     logging.info("Verifying endpoint availability for backfill")
                     contracts = collector.discover_contracts_for_day(
@@ -1503,9 +1504,9 @@ def main():
         datefmt='%H:%M:%S'
     )
 
-    # run_thetadata_collection()
+    run_thetadata_collection()
 
-    run_regular_collection() 
+    # run_regular_collection() 
 
 
 
