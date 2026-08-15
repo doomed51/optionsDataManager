@@ -413,9 +413,6 @@ class ThetaDataOptionsBackfillCollector:
                     num_expiries=num_expiries,
                 )
                 logging.info('Backfilling %d contracts for %s on %s', len(contracts), symbol, trade_date)
-                # print(len(contracts))
-                # print(num_expiries, num_strikes)
-                # exit() 
 
                 if not contracts:
                     logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, trade_date)
@@ -451,6 +448,11 @@ class ThetaDataOptionsBackfillCollector:
                     elapsed,
                     elapsed.total_seconds(),
                 )
+        except KeyboardInterrupt:
+            logging.info("Backfill interrupted; cancelling queued work.")
+            executor.shutdown(wait=True, cancel_futures=True)
+            executor = None
+            raise
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
@@ -729,7 +731,7 @@ class ThetaDataOptionsBackfillCollector:
             collection_batch=collection_batch,
         )
         if checkpoint.status == 'COMPLETE':
-            logging.info('ThetaData already collected for %s on %s at interval %s', contract, request_date, interval)
+            logging.debug('ThetaData already collected for %s on %s at interval %s', contract, request_date, interval)
             return 0
         if checkpoint.next_retry_at is not None and checkpoint.next_retry_at > datetime.now():
             return 0
