@@ -3,11 +3,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import logging
+import math
 import os
 from typing import Any, Callable, Dict, List, Optional
 from thetadata import ThetaClient
 
 import polars as pl
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import config as cfg
 
 from database import ThetaDataCollectionCheckpoint, ThetaDataOptionHistory
@@ -49,6 +53,8 @@ class EndpointAvailability:
 
 class ThetaDataOptionsBackfillCollector:
     """Thin ThetaData client adapter used by the historical backfill workflow."""
+
+    PERSIST_CHUNK_SIZE = 1000
 
     REQUIRED_ENDPOINTS = {
         'quote': 'option_history_quote',
@@ -320,9 +326,6 @@ class ThetaDataOptionsBackfillCollector:
         
         logging.debug('Found %d expirations with available data for %s on %s', len(expirations_with_data), symbol, trade_date)
         expirations = sorted(expirations_with_data[:num_expiries])
-        print(expirations) 
-        
-        
 
         # determine high/low prices to establish strike bounds 
         strike_frame = self.client.option_list_strikes(symbol=symbol, expiration=expirations[0])
@@ -645,31 +648,68 @@ class ThetaDataOptionsBackfillCollector:
         collection_batch: str,
     ) -> int:
         """Insert or enrich first-order Greek rows without replacing stored values with nulls."""
-        stored_count = 0
-        for record in frame.to_dicts():
-            existing = session.query(ThetaDataOptionHistory).filter_by(
-                symbol=record['symbol'],
-                expiry=record['expiry'],
-                strike=record['strike'],
-                right=record['right'],
-                interval=record['interval'],
-                timestamp=record['timestamp'],
-            ).first()
+        records = [
+            {
+                **{
+                    column_name: (
+                        value if not isinstance(value, float) or math.isfinite(value) else None
+                    )
+                    for column_name, value in record.items()
+                },
+                'collection_batch': collection_batch,
+            }
+            for record in frame.to_dicts()
+        ]
+        if not records:
+            return 0
 
-            if existing is None:
-                session.add(ThetaDataOptionHistory(collection_batch=collection_batch, **record))
-                stored_count += 1
-                continue
+        dialect_name = session.get_bind().dialect.name
+        if dialect_name == 'postgresql':
+            insert_factory = postgresql_insert
+        elif dialect_name == 'sqlite':
+            insert_factory = sqlite_insert
+        else:
+            raise NotImplementedError(
+                f'Bulk ThetaData history upserts are not supported for {dialect_name}.'
+            )
 
-            for column_name, value in record.items():
-                if value is not None:
-                    setattr(existing, column_name, value)
-            existing.collection_batch = collection_batch
-            stored_count += 1
+        identity_columns = {'symbol', 'expiry', 'strike', 'right', 'interval', 'timestamp'}
+        update_columns = [
+            column_name
+            for column_name in records[0]
+            if column_name not in identity_columns and column_name != 'collection_batch'
+        ]
 
-        
-        # session.commit()
-        return stored_count
+        for start_index in range(0, len(records), self.PERSIST_CHUNK_SIZE):
+            chunk = records[start_index:start_index + self.PERSIST_CHUNK_SIZE]
+            statement = insert_factory(ThetaDataOptionHistory).values(chunk)
+            update_values = {}
+            for column_name in update_columns:
+                model_attribute = getattr(ThetaDataOptionHistory, column_name)
+                database_column = model_attribute.property.columns[0]
+                update_values[database_column.name] = func.coalesce(
+                    statement.excluded[database_column.name],
+                    database_column,
+                )
+
+            statement = statement.on_conflict_do_update(
+                index_elements=[
+                    ThetaDataOptionHistory.symbol,
+                    ThetaDataOptionHistory.expiry,
+                    ThetaDataOptionHistory.strike,
+                    ThetaDataOptionHistory.right,
+                    ThetaDataOptionHistory.interval,
+                    ThetaDataOptionHistory.timestamp,
+                ],
+                set_={
+                    **update_values,
+                    'collection_batch': statement.excluded.collection_batch,
+                    'updated_at': func.now(),
+                },
+            )
+            session.execute(statement)
+
+        return len(records)
 
     def collect_contract_day(   
         self,
@@ -680,7 +720,7 @@ class ThetaDataOptionsBackfillCollector:
         collection_batch: str,
     ) -> int:
         """Collect a contract/day/interval once and checkpoint only a successful merged write."""
-        logging.info('Collecting ThetaData for %s on %s at interval %s', contract, request_date, interval)
+        logging.debug('Collecting ThetaData for %s on %s at interval %s', contract, request_date, interval)
         checkpoint = self._get_or_create_contract_checkpoint(
             session=session,
             contract=contract,
@@ -703,7 +743,7 @@ class ThetaDataOptionsBackfillCollector:
             fetch_start = datetime.now()
             frame = self.fetch_contract_history(contract, request_date, interval)
             fetch_elapsed = datetime.now() - fetch_start
-            logging.info(
+            logging.debug(
                 'ThetaData fetch for %s on %s at interval %s took %s (seconds=%.2f)',
                 contract,
                 request_date,
@@ -715,7 +755,7 @@ class ThetaDataOptionsBackfillCollector:
             persist_start = datetime.now()
             stored_count = self.persist_first_order_greeks(session, frame, collection_batch)
             persist_elapsed = datetime.now() - persist_start
-            logging.info(
+            logging.debug(
                 'ThetaData persist for %s on %s at interval %s took %s (seconds=%.2f)',
                 contract,
                 request_date,

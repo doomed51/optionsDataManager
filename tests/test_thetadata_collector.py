@@ -408,6 +408,34 @@ class ThetaDataOptionsBackfillCollectorTests(unittest.TestCase):
         self.assertEqual(collector.persist_first_order_greeks(session, hourly_frame, 'batch-c'), 1)
         self.assertEqual(session.query(ThetaDataOptionHistory).count(), 2)
 
+    def test_bulk_upsert_chunks_records_and_normalizes_non_finite_floats(self):
+        engine = create_engine('sqlite:///:memory:')
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        collector = ThetaDataOptionsBackfillCollector(client=FakeThetaClient())
+        collector.PERSIST_CHUNK_SIZE = 2
+        base_frame = collector.fetch_first_order_greeks(self.contract, self.request_date, '1m')
+        frame = pl.concat(
+            [
+                base_frame.with_columns(
+                    pl.lit(datetime(2026, 8, 10, 10, minute)).alias('timestamp'),
+                    pl.lit(float('nan')).alias('delta'),
+                    pl.lit(float('inf')).alias('theta'),
+                )
+                for minute in range(3)
+            ]
+        )
+
+        with patch.object(session, 'execute', wraps=session.execute) as execute:
+            stored_count = collector.persist_first_order_greeks(session, frame, 'batch-chunked')
+
+        self.assertEqual(stored_count, 3)
+        self.assertEqual(execute.call_count, 2)
+        stored_rows = session.query(ThetaDataOptionHistory).all()
+        self.assertEqual(len(stored_rows), 3)
+        self.assertTrue(all(row.delta is None for row in stored_rows))
+        self.assertTrue(all(row.theta is None for row in stored_rows))
+
     def test_persists_implied_volatility_endpoint_fields(self):
         engine = create_engine('sqlite:///:memory:')
         Base.metadata.create_all(engine)

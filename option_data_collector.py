@@ -294,7 +294,7 @@ class ThetaDataBackfillService:
                         intervals=list(cfg.THETADATA_INTERVALS),
                         collection_batch=batch_id,
                         session_factory=db_manager.get_session,
-                        max_workers=1,
+                        max_workers=4,
                     )
 
                     logging.info('ThetaData %s completed: %s rows stored.', symbol, stored_count)
