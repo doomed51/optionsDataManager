@@ -412,7 +412,7 @@ class ThetaDataOptionsBackfillCollector:
                     num_strikes=num_strikes,
                     num_expiries=num_expiries,
                 )
-                logging.info('Backfilling %d contracts for %s on %s', len(contracts), symbol, trade_date)
+                logging.info('Found %d contracts', len(contracts))
 
                 if not contracts:
                     logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, trade_date)
