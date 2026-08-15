@@ -262,6 +262,53 @@ class ThetaDataOptionsBackfillCollectorTests(unittest.TestCase):
         self.assertEqual(stored_count, 2)
         self.assertEqual(session.query(ThetaDataOptionHistory).count(), 2)
 
+    def test_backfills_contracts_with_at_most_four_workers(self):
+        from threading import Barrier, Lock
+
+        collector = ThetaDataOptionsBackfillCollector(client=FakeThetaClient())
+        contracts = [
+            ThetaDataContract('SPX', date(2026, 9, 18), 6400.0 + strike, 'C')
+            for strike in range(8)
+        ]
+        barrier = Barrier(4)
+        lock = Lock()
+        state = {'active': 0, 'max_active': 0, 'closed_sessions': 0}
+
+        def collect_contract_day(**kwargs):
+            with lock:
+                state['active'] += 1
+                state['max_active'] = max(state['max_active'], state['active'])
+            barrier.wait(timeout=2)
+            with lock:
+                state['active'] -= 1
+            return 1
+
+        class WorkerSession:
+            def close(self):
+                with lock:
+                    state['closed_sessions'] += 1
+
+        with patch.object(collector, 'discover_contracts_for_day', return_value=contracts), patch.object(
+            collector,
+            'collect_contract_day',
+            side_effect=collect_contract_day,
+        ):
+            stored_count = collector.backfill_daily_subsets(
+                session=None,
+                symbol='SPX',
+                daily_prices={self.request_date: {'high': 6500.0, 'low': 6500.0}},
+                num_strikes=0,
+                num_expiries=1,
+                intervals=['1m'],
+                collection_batch='parallel-subset',
+                session_factory=WorkerSession,
+                max_workers=4,
+            )
+
+        self.assertEqual(stored_count, 8)
+        self.assertEqual(state['max_active'], 4)
+        self.assertEqual(state['closed_sessions'], 8)
+
     def test_lists_and_bounds_available_quote_dates(self):
         client = FakeThetaClient()
         collector = ThetaDataOptionsBackfillCollector(client=client)

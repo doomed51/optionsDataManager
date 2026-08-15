@@ -1,4 +1,5 @@
 """ThetaData option-history access with provider-safe failure handling."""
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import logging
@@ -319,6 +320,8 @@ class ThetaDataOptionsBackfillCollector:
         
         logging.debug('Found %d expirations with available data for %s on %s', len(expirations_with_data), symbol, trade_date)
         expirations = sorted(expirations_with_data[:num_expiries])
+        print(expirations) 
+        
         
 
         # determine high/low prices to establish strike bounds 
@@ -351,6 +354,9 @@ class ThetaDataOptionsBackfillCollector:
             high_index = min(range(len(strikes)), key=lambda index: abs(strikes[index] - high_price))
             start_index = max(0, low_index - num_strikes)
             end_index = min(len(strikes), high_index + num_strikes + 1)
+
+            # print(strikes[start_index:end_index])
+            # print(low_price, high_price) 
             
             for strike in strikes[start_index:end_index]:
                 contracts.extend(
@@ -370,43 +376,82 @@ class ThetaDataOptionsBackfillCollector:
         num_expiries: int,
         intervals: List[str],
         collection_batch: str,
+        session_factory: Optional[Callable[[], Any]] = None,
+        max_workers: int = 4,
     ) -> int:
         """Backfill contracts selected independently for every vendor-confirmed day."""
         stored_count = 0
 
-        for trade_date, prices in sorted(daily_prices.items()):
-            start_time = datetime.now()
-            logging.info('Starting backfill for %s on %s', symbol, trade_date)
-            contracts = self.discover_contracts_for_day(
-                symbol=symbol,
-                trade_date=trade_date,
-                num_strikes=num_strikes,
-                num_expiries=num_expiries,
-            )
+        def collect_one(contract: ThetaDataContract, trade_date: date, interval: str) -> int:
+            worker_session = session_factory()
+            try:
+                return self.collect_contract_day(
+                    session=worker_session,
+                    contract=contract,
+                    request_date=trade_date,
+                    interval=interval,
+                    collection_batch=collection_batch,
+                )
+            finally:
+                worker_session.close()
 
-            if not contracts: 
-                logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, trade_date)
-                continue
-            
-            for contract in contracts:
-                for interval in intervals:
-                    # logging.info('Collecting ThetaData on %s for %s %s %s %s at interval %s', trade_date, contract.symbol, contract.expiration, contract.strike, contract.right, interval)
-                    stored_count += self.collect_contract_day(
-                        session=session,
-                        contract=contract,
-                        request_date=trade_date,
-                        interval=interval,
-                        collection_batch=collection_batch,
-                    )
+        executor = None
+        if session_factory is not None:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
 
-            elapsed = datetime.now() - start_time
-            logging.info(
-                'Finished backfill for %s on %s in %s (seconds=%.2f)',
-                symbol,
-                trade_date,
-                elapsed,
-                elapsed.total_seconds(),
-            )
+        try:
+            for trade_date, prices in sorted(daily_prices.items()):
+                start_time = datetime.now()
+                logging.info('Starting backfill for %s on %s', symbol, trade_date)
+                contracts = self.discover_contracts_for_day(
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    num_strikes=num_strikes,
+                    num_expiries=num_expiries,
+                )
+                logging.info('Backfilling %d contracts for %s on %s', len(contracts), symbol, trade_date)
+                # print(len(contracts))
+                # print(num_expiries, num_strikes)
+                # exit() 
+
+                if not contracts:
+                    logging.warning('No ThetaData contracts discovered for %s on %s.', symbol, trade_date)
+                    continue
+
+                work_items = [
+                    (contract, interval)
+                    for contract in contracts
+                    for interval in intervals
+                ]
+
+                if executor is None:
+                    for contract, interval in work_items:
+                        stored_count += self.collect_contract_day(
+                            session=session,
+                            contract=contract,
+                            request_date=trade_date,
+                            interval=interval,
+                            collection_batch=collection_batch,
+                        )
+                else:
+                    futures = [
+                        executor.submit(collect_one, contract, trade_date, interval)
+                        for contract, interval in work_items
+                    ]
+                    stored_count += sum(future.result() for future in futures)
+
+                elapsed = datetime.now() - start_time
+                logging.info(
+                    'Finished backfill for %s on %s in %s (seconds=%.2f)',
+                    symbol,
+                    trade_date,
+                    elapsed,
+                    elapsed.total_seconds(),
+                )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+
         return stored_count
 
     def available_quote_dates(
@@ -635,6 +680,7 @@ class ThetaDataOptionsBackfillCollector:
         collection_batch: str,
     ) -> int:
         """Collect a contract/day/interval once and checkpoint only a successful merged write."""
+        logging.info('Collecting ThetaData for %s on %s at interval %s', contract, request_date, interval)
         checkpoint = self._get_or_create_contract_checkpoint(
             session=session,
             contract=contract,
@@ -643,7 +689,7 @@ class ThetaDataOptionsBackfillCollector:
             collection_batch=collection_batch,
         )
         if checkpoint.status == 'COMPLETE':
-            logging.info('ThetaData already collected for %s on %s at interval %s', contract.symbol, request_date, interval)
+            logging.info('ThetaData already collected for %s on %s at interval %s', contract, request_date, interval)
             return 0
         if checkpoint.next_retry_at is not None and checkpoint.next_retry_at > datetime.now():
             return 0
@@ -654,8 +700,29 @@ class ThetaDataOptionsBackfillCollector:
         # session.commit()
 
         try:
+            fetch_start = datetime.now()
             frame = self.fetch_contract_history(contract, request_date, interval)
+            fetch_elapsed = datetime.now() - fetch_start
+            logging.info(
+                'ThetaData fetch for %s on %s at interval %s took %s (seconds=%.2f)',
+                contract,
+                request_date,
+                interval,
+                fetch_elapsed,
+                fetch_elapsed.total_seconds(),
+            )
+
+            persist_start = datetime.now()
             stored_count = self.persist_first_order_greeks(session, frame, collection_batch)
+            persist_elapsed = datetime.now() - persist_start
+            logging.info(
+                'ThetaData persist for %s on %s at interval %s took %s (seconds=%.2f)',
+                contract,
+                request_date,
+                interval,
+                persist_elapsed,
+                persist_elapsed.total_seconds(),
+            )
 
         except ThetaDataEndpointUnavailable as exc:
             checkpoint.status = 'RETRY'

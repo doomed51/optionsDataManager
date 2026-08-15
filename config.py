@@ -13,11 +13,11 @@ WHATTOSHOW_MAPPING = {
 # symbol, strikes above the high and below the ask price of the underlying, number of expiries forward from the current date
 COLLECTION_SYMBOLS_METADATA = {
     "SPX": {"strikes": 10, "expiries": 10},
-    "AVGO": {"strikes": 5, "expiries": 3},
+    "AVGO": {"strikes": 10, "expiries": 3},
 }
 
-DEFAULT_NUM_STRIKES = 5
-DEFAULT_NUM_EXPIRIES = 3
+DEFAULT_NUM_STRIKES = 10
+DEFAULT_NUM_EXPIRIES = 5
 
 # Additional underlyings collected only through ThetaData. ThetaData collection
 # always includes these symbols and the symbols in COLLECTION_SYMBOLS_METADATA.

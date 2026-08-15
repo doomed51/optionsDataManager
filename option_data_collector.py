@@ -212,7 +212,7 @@ class ThetaDataBackfillService:
             successful_symbols = []
 
             for symbol in normalized_symbols:
-                if symbol != 'SPX':
+                if symbol != 'SPXW':
                     continue
                 logging.info('Starting ThetaData backfill for %s', symbol)
 
@@ -293,6 +293,8 @@ class ThetaDataBackfillService:
                         num_expiries=num_expiries,
                         intervals=list(cfg.THETADATA_INTERVALS),
                         collection_batch=batch_id,
+                        session_factory=db_manager.get_session,
+                        max_workers=1,
                     )
 
                     logging.info('ThetaData %s completed: %s rows stored.', symbol, stored_count)
