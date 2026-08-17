@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from database import Base, ThetaDataCollectionCheckpoint, ThetaDataOptionHistory
-from option_data_collector import ThetaDataBackfillService
+from option_data_collector import ThetaDataBackfillService, run_thetadata_collection
 from thetadata_collector import ThetaDataContract, ThetaDataOptionsBackfillCollector
 
 
@@ -137,6 +137,30 @@ class FakeThetaClient:
                 'implied_vol': [0.2],
             }
         )
+
+
+class RunThetaDataCollectionTests(unittest.TestCase):
+    @patch('option_data_collector.time_.sleep')
+    @patch('option_data_collector.collect_thetadata_data', side_effect=[False, False, True])
+    def test_retries_failed_passes_with_capped_exponential_backoff(self, collect, sleep):
+        succeeded = run_thetadata_collection(
+            max_attempts=3,
+            initial_retry_delay_seconds=3,
+            max_retry_delay_seconds=5,
+        )
+
+        self.assertTrue(succeeded)
+        self.assertEqual(collect.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 5])
+
+    @patch('option_data_collector.time_.sleep')
+    @patch('option_data_collector.collect_thetadata_data', return_value=False)
+    def test_stops_after_maximum_attempts(self, collect, sleep):
+        succeeded = run_thetadata_collection(max_attempts=2, initial_retry_delay_seconds=1)
+
+        self.assertFalse(succeeded)
+        self.assertEqual(collect.call_count, 2)
+        sleep.assert_called_once_with(1)
 
 
 class ThetaDataOptionsBackfillCollectorTests(unittest.TestCase):
