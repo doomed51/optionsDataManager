@@ -1,4 +1,5 @@
 from collections import deque
+import traceback
 from typing import Deque, List, Optional, Dict, Tuple
 from ib_insync import IB, Contract, Option, Stock, Index, Future, util
 import pandas as pd
@@ -10,6 +11,7 @@ from pathlib import Path
 import hashlib
 import os
 import sqlite3
+import argparse
 
 from sqlalchemy import func
 from options_data_retriever import OptionsDataRetriever
@@ -193,6 +195,7 @@ class ThetaDataBackfillService:
         symbols: Optional[List[str]] = None,
         start_date: Optional[dt_date] = None,
         end_date: Optional[dt_date] = None,
+        max_workers: int = 4,
     ) -> bool:
         """Backfill ThetaData contracts selected from each day's underlying high and low."""
         db_manager = None
@@ -294,7 +297,7 @@ class ThetaDataBackfillService:
                         intervals=list(cfg.THETADATA_INTERVALS),
                         collection_batch=batch_id,
                         session_factory=db_manager.get_session,
-                        max_workers=4,
+                        max_workers=max_workers,
                     )
 
                     logging.info('ThetaData %s completed: %s rows stored.', symbol, stored_count)
@@ -320,9 +323,10 @@ def collect_thetadata_data(
     symbols: Optional[List[str]] = None,
     start_date: Optional[dt_date] = None,
     end_date: Optional[dt_date] = None,
+    max_workers: int = 4,
 ) -> bool:
     """Run the ThetaData backfill service for explicit or configured symbols."""
-    return ThetaDataBackfillService().collect(symbols, start_date, end_date)
+    return ThetaDataBackfillService().collect(symbols, start_date, end_date, max_workers = max_workers)
 
 
 
@@ -1388,8 +1392,50 @@ class OptionsDataCollector:
 
 # __________________________   >>>>>>>>>>>>>>>||   ENTRY POINT  ||<<<<<<<<<<<<<<<< __________________________
 
-def run_thetadata_collection():
-    print( collect_thetadata_data() )
+def run_thetadata_collection(
+    max_attempts: int = 20,
+    initial_retry_delay_seconds: int = 30,
+    max_retry_delay_seconds: int = 3600,
+) -> bool:
+    """Run the resumable ThetaData backfill, retrying failed collection passes."""
+    retry_delay = initial_retry_delay_seconds
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            succeeded = collect_thetadata_data(max_workers = 4)
+        except KeyboardInterrupt:
+            logging.info('ThetaData collection interrupted by user.')
+            raise
+        except Exception:
+            logging.exception(
+                'ThetaData collection attempt %d of %d raised an unexpected error: %s',
+                attempt,
+                max_attempts,
+                traceback.format_exc(),
+            )
+            succeeded = False
+
+        if succeeded:
+            print(True)
+            return True
+
+        if attempt == max_attempts:
+            logging.error('ThetaData collection failed after %d attempts; no more retries.', max_attempts)
+            break
+
+        logging.warning(
+            'ThetaData collection attempt %d of %d did not complete; '
+            'restarting in %d seconds.',
+            attempt,
+            max_attempts,
+            retry_delay,
+        )
+        time_.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, max_retry_delay_seconds)
+
+    logging.error('ThetaData collection did not complete after %d attempts.', max_attempts)
+    print(False)
+    return False
 
 def run_regular_collection():
     skew_schedule = [
@@ -1500,15 +1546,35 @@ def run_regular_collection():
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description='Run ThetaData and/or regular options data collection.'
+    )
+    parser.add_argument(
+        '--td',
+        action='store_true',
+        help='run the ThetaData collection'
+    )
+    parser.add_argument(
+        '--regular',
+        action='store_true',
+        help='run the regular scheduled collection'
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(message)s',
         datefmt='%H:%M:%S'
     )
 
-    run_thetadata_collection()
+    # Preserve the existing behavior when no option is supplied.
+    if not args.td and not args.regular:
+        args.td = True
 
-    # run_regular_collection() 
+    if args.td:
+        run_thetadata_collection()
+    if args.regular:
+        run_regular_collection()
 
 
 
