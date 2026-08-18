@@ -215,8 +215,8 @@ class ThetaDataBackfillService:
             successful_symbols = []
 
             for symbol in normalized_symbols:
-                if symbol != 'SPXW':
-                    continue
+                # if symbol != 'SPXW':
+                #     continue
                 logging.info('Starting ThetaData backfill for %s', symbol)
 
                 metadata = cfg.COLLECTION_SYMBOLS_METADATA.get(symbol, {})
@@ -1520,7 +1520,7 @@ def run_regular_collection():
         for slot_label, slot_time in skew_schedule:
             if skew_done[slot_label]:
                 continue
-            if current_time >= slot_time:
+            if current_time >= slot_time and current_time < time(15,0):
                 logging.info(f"Triggering skew collection for {slot_label} slot at {current_time}")
                 try:
                     run_skew_collection_once()
