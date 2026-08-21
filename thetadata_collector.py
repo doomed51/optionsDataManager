@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import logging
 import math
 import os
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from thetadata import ThetaClient
 
 import polars as pl
@@ -327,16 +327,7 @@ class ThetaDataOptionsBackfillCollector:
         logging.debug('Found %d expirations with available data for %s on %s', len(expirations_with_data), symbol, trade_date)
         expirations = sorted(expirations_with_data[:num_expiries])
 
-        # determine high/low prices to establish strike bounds 
-        strike_frame = self.client.option_list_strikes(symbol=symbol, expiration=expirations[0])
-        strikes = sorted(strike_frame.get_column('strike').cast(pl.Float64).unique().to_list())
-        middle_strike = strikes[len(strikes) // 2]
-        contract = ThetaDataContract(symbol, expirations[0], middle_strike, 'C')
-
-        implied_volatility = self.fetch_implied_volatility(contract, trade_date, '1m')
-        high_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().max()
-        low_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().min()
-
+        high_price, low_price = self._get_high_low_underlying_price_for_day(expirations, trade_date, symbol)
         contracts: List[ThetaDataContract] = []
         for expiration in expirations:
             try:
@@ -357,9 +348,6 @@ class ThetaDataOptionsBackfillCollector:
             high_index = min(range(len(strikes)), key=lambda index: abs(strikes[index] - high_price))
             start_index = max(0, low_index - num_strikes)
             end_index = min(len(strikes), high_index + num_strikes + 1)
-
-            # print(strikes[start_index:end_index])
-            # print(low_price, high_price) 
             
             for strike in strikes[start_index:end_index]:
                 contracts.extend(
@@ -368,7 +356,40 @@ class ThetaDataOptionsBackfillCollector:
                         ThetaDataContract(symbol, expiration, strike, 'P'),
                     ]
                 )
+
         return contracts
+
+    def _get_high_low_underlying_price_for_day(self, expirations: List, trade_date: date, symbol: str) -> Tuple[float, float]:
+        logger.info('Determining high and low underlying prices for %s on %s', symbol, trade_date)
+        global_strikes = [] 
+        for exp in expirations:
+            # determine high/low prices to establish strike bounds 
+            strike_frame = self.client.option_list_strikes(symbol=symbol, expiration=exp) 
+            strikes = sorted(strike_frame.get_column('strike').cast(pl.Float64).unique().to_list())
+            for strike in strikes: 
+                for right in ['C', 'P']: 
+                    contract = ThetaDataContract(symbol, exp, strike, right)
+                    implied_volatility = self.fetch_implied_volatility(contract, trade_date, '1m')
+                    high_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().max()
+                    low_price = implied_volatility.get_column('underlying_price').drop_nulls().drop_nans().min()
+
+
+                    if high_price and low_price:
+                        logger.debug('For %s on %s, determined high price %.2f and low price %.2f from implied volatility data.', symbol, trade_date, high_price, low_price)
+                        return high_price, low_price
+                    
+                    if strike not in global_strikes:
+                        global_strikes.append(strike)
+
+        # when no data is found, set the high and low prices based on the mid price of the available strikes 
+        logger.info('No implied volatility data found for %s on %s; using mid strike to estimate high and low prices.', symbol, trade_date)
+        if global_strikes:
+            mid_strike = global_strikes[len(global_strikes) // 2]
+            high_price = mid_strike * 1.1
+            low_price = mid_strike * 0.9
+            return high_price, low_price
+
+        return None, None
 
     def backfill_daily_subsets(
         self,
@@ -424,15 +445,17 @@ class ThetaDataOptionsBackfillCollector:
                     for interval in intervals
                 ]
 
+                
                 if executor is None:
                     for contract, interval in work_items:
-                        stored_count += self.collect_contract_day(
+                        sc += self.collect_contract_day(
                             session=session,
                             contract=contract,
                             request_date=trade_date,
                             interval=interval,
                             collection_batch=collection_batch,
                         )
+                        stored_count += sc
                 else:
                     futures = [
                         executor.submit(collect_one, contract, trade_date, interval)
@@ -658,6 +681,7 @@ class ThetaDataOptionsBackfillCollector:
                     )
                     for column_name, value in record.items()
                 },
+                'dte': (record['expiry'] - record['timestamp'].date()).days,
                 'collection_batch': collection_batch,
             }
             for record in frame.to_dicts()
