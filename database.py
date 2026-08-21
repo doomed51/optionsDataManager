@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     UniqueConstraint,
     Text,
+    inspect,
 )
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -371,6 +372,7 @@ class ThetaDataOptionHistory(Base):
     rho = Column(Float)
     epsilon = Column(Float)
     lambda_ = Column('lambda', Float)
+    dte = Column(Integer)
 
     collection_batch = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime, default=func.now())
@@ -477,6 +479,15 @@ class DatabaseManager:
     def create_tables(self):
         """Create all tables"""
         Base.metadata.create_all(bind=self.engine)
+        column_names = {
+            column['name']
+            for column in inspect(self.engine).get_columns('thetadata_option_history')
+        }
+        if 'dte' not in column_names:
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    'ALTER TABLE thetadata_option_history ADD COLUMN dte INTEGER'
+                )
     
     def get_session(self):
         """Get database session"""
