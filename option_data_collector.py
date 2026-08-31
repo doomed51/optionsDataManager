@@ -215,7 +215,7 @@ class ThetaDataBackfillService:
             successful_symbols = []
 
             for symbol in normalized_symbols:
-                # if symbol != 'SPXW':
+                # if symbol != 'AVGO':
                 #     continue
                 logging.info('Starting ThetaData backfill for %s', symbol)
 
@@ -1396,13 +1396,14 @@ def run_thetadata_collection(
     max_attempts: int = 20,
     initial_retry_delay_seconds: int = 30,
     max_retry_delay_seconds: int = 3600,
+    max_workers: int = 4
 ) -> bool:
     """Run the resumable ThetaData backfill, retrying failed collection passes."""
     retry_delay = initial_retry_delay_seconds
 
     for attempt in range(1, max_attempts + 1):
         try:
-            succeeded = collect_thetadata_data(max_workers = 4)
+            succeeded = collect_thetadata_data(max_workers = max_workers)
         except KeyboardInterrupt:
             logging.info('ThetaData collection interrupted by user.')
             raise
@@ -1563,7 +1564,7 @@ def main():
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s %(message)s',
+        format='%(asctime)s %(levelname)s %(message)s',
         datefmt='%H:%M:%S'
     )
 
@@ -1572,7 +1573,7 @@ def main():
         args.td = True
 
     if args.td:
-        run_thetadata_collection()
+        run_thetadata_collection(max_workers=4)
     if args.regular:
         run_regular_collection()
 
