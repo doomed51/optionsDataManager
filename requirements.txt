@@ -9,3 +9,4 @@ py_vollib
 schedule
 python-dotenv
 thetadata
+pyarrow>=18,<22
