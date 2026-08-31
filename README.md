@@ -35,6 +35,7 @@ A comprehensive system for collecting options data with implied volatility, Gree
    ```bash
    pip install -r requirements.txt
    ```
+   To run DuckDB compatibility tests, install `requirements-dev.txt` instead.
 
 3. **Set up PostgreSQL database**:
    - Install PostgreSQL and ensure it's running
@@ -98,6 +99,76 @@ TENOR_DELTA_RUN_TIMES = ['10:00', '12:00', '13:00', '15:00']
 ```
 
 ## Usage
+
+### ThetaData Parquet Analytics Layer
+
+The optional Parquet layer exports only PostgreSQL `thetadata_option_history`
+rows. PostgreSQL remains authoritative. Configure an absolute dataset root in
+`.env`, then enable the layer:
+
+```env
+PARQUET_ENABLED=true
+PARQUET_ROOT=F:\data\options-parquet
+```
+
+Validate the configuration and run maintenance through the standalone CLI:
+
+```bash
+python parquet_layer.py config-check
+python parquet_layer.py refresh
+python parquet_layer.py reconcile --start 2026-08-01 --end 2026-08-31
+python parquet_layer.py rebuild
+python parquet_layer.py schedule
+```
+
+`schedule` remains running and performs an incremental refresh every day at
+03:00 `America/Toronto`. Starting it after 03:00 does not replay that day's
+missed run. Writers are serialized with a PostgreSQL advisory lock.
+
+The stable Hive layout is:
+
+```text
+symbol=<symbol>/interval=<interval>/year=YYYY/month=MM/part-NNNNN.parquet
+```
+
+During publication, `_PARQUET_REFRESH_IN_PROGRESS` exists beneath the root.
+Do not start analytics while that marker is present. Refreshes stage and
+validate complete monthly partitions before swapping them into place; failed
+publication restores the prior partition. A full rebuild may temporarily need
+about twice the live dataset's disk space.
+Validated monthly partitions from an interrupted full rebuild are retained and
+reused when the source watermark and partition set are unchanged.
+
+R Arrow opens the configured root directly:
+
+```r
+library(arrow)
+library(dplyr)
+
+options_ds <- open_dataset(parquet_root, partitioning = "hive")
+result <- options_ds |>
+  filter(symbol == "SPX", interval == "1m", year == 2026, month == 8) |>
+  collect()
+```
+
+DuckDB should use a glob that excludes maintenance directories:
+
+```sql
+SELECT *
+FROM read_parquet(
+  'F:/data/options-parquet/symbol=*/interval=*/year=*/month=*/*.parquet',
+  hive_partitioning = true
+)
+WHERE symbol = 'SPX'
+  AND interval = '1m'
+  AND year = 2026
+  AND month = 8;
+```
+
+All source columns are exposed with source-compatible types. Source datetimes
+are treated as UTC. Incremental refresh uses the existing `updated_at`
+watermark; physical source deletions are not detected incrementally and have no
+special deletion contract in this version.
 
 ### Configuration Check
 ```bash
