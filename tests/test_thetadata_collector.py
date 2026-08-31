@@ -432,6 +432,31 @@ class ThetaDataOptionsBackfillCollectorTests(unittest.TestCase):
         self.assertEqual(collector.persist_first_order_greeks(session, hourly_frame, 'batch-c'), 1)
         self.assertEqual(session.query(ThetaDataOptionHistory).count(), 2)
 
+    def test_persists_dte_from_expiry_and_bar_timestamp(self):
+        engine = create_engine('sqlite:///:memory:')
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        collector = ThetaDataOptionsBackfillCollector(client=FakeThetaClient())
+        frame = collector.fetch_first_order_greeks(self.contract, self.request_date, '1m')
+        expiry_day_frame = frame.with_columns(
+            pl.lit(date(2026, 8, 10)).alias('expiry'),
+            pl.lit(datetime(2026, 8, 10, 10, 0)).alias('timestamp'),
+        )
+
+        self.assertEqual(
+            collector.persist_first_order_greeks(
+                session,
+                pl.concat([frame, expiry_day_frame]),
+                'batch-dte',
+            ),
+            2,
+        )
+        dte_by_expiry = {
+            row.expiry: row.dte for row in session.query(ThetaDataOptionHistory).all()
+        }
+        self.assertEqual(dte_by_expiry[date(2026, 9, 18)], 39)
+        self.assertEqual(dte_by_expiry[date(2026, 8, 10)], 0)
+
     def test_bulk_upsert_chunks_records_and_normalizes_non_finite_floats(self):
         engine = create_engine('sqlite:///:memory:')
         Base.metadata.create_all(engine)
