@@ -5,9 +5,12 @@ from datetime import date, datetime, timedelta
 import logging
 import math
 import os
+import re
+import time as time_module
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from thetadata import ThetaClient
 
+import pandas_market_calendars as mcal
 import polars as pl
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -49,6 +52,17 @@ class EndpointAvailability:
     available: bool
     endpoint: Optional[str] = None
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class HistoryCoverage:
+    """Completeness assessment for one contract/day history response."""
+
+    complete: bool
+    expected_bars: int
+    observed_bars: int
+    missing_price_bars: int
+    reason: str | None = None
 
 
 class ThetaDataOptionsBackfillCollector:
@@ -737,7 +751,7 @@ class ThetaDataOptionsBackfillCollector:
 
         return len(records)
 
-    def collect_contract_day(   
+    def collect_contract_day(
         self,
         session: Any,
         contract: ThetaDataContract,
@@ -745,74 +759,58 @@ class ThetaDataOptionsBackfillCollector:
         interval: str,
         collection_batch: str,
     ) -> int:
-        """Collect a contract/day/interval once and checkpoint only a successful merged write."""
-        logging.debug('Collecting ThetaData for %s on %s at interval %s', contract, request_date, interval)
-        checkpoint = self._get_or_create_contract_checkpoint(
-            session=session,
-            contract=contract,
-            request_date=request_date,
-            interval=interval,
-            collection_batch=collection_batch,
-        )
+        """Collect one contract-day, retrying incomplete frames before checkpointing."""
+        logger.debug('Collecting ThetaData for %s on %s at interval %s', contract, request_date, interval)
+        checkpoint = self._get_or_create_contract_checkpoint(session=session, contract=contract, request_date=request_date, interval=interval, collection_batch=collection_batch)
         if checkpoint.status == 'COMPLETE':
-            logging.debug('ThetaData already collected for %s on %s at interval %s', contract, request_date, interval)
             return 0
         if checkpoint.next_retry_at is not None and checkpoint.next_retry_at > datetime.now():
             return 0
 
         checkpoint.status = 'IN_PROGRESS'
-        checkpoint.attempts = (checkpoint.attempts or 0) + 1
         checkpoint.next_retry_at = None
-        # session.commit()
-
+        max_retries = max(0, int(cfg.THETADATA_MISSING_DATA_MAX_RETRIES))
+        retry_delay_seconds = max(0, int(cfg.THETADATA_MISSING_DATA_RETRY_DELAY_SECONDS))
+        coverage: HistoryCoverage | None = None
         try:
-            fetch_start = datetime.now()
-            frame = self.fetch_contract_history(contract, request_date, interval)
-            fetch_elapsed = datetime.now() - fetch_start
-            logging.debug(
-                'ThetaData fetch for %s on %s at interval %s took %s (seconds=%.2f)',
-                contract,
-                request_date,
-                interval,
-                fetch_elapsed,
-                fetch_elapsed.total_seconds(),
-            )
+            for immediate_attempt in range(max_retries + 1):
+                checkpoint.attempts = (checkpoint.attempts or 0) + 1
+                frame = self.fetch_contract_history(contract, request_date, interval)
+                coverage = self.assess_history_frame(frame, request_date, interval)
+                logger.info('ThetaData coverage symbol=%s expiry=%s strike=%s right=%s date=%s interval=%s attempt=%d expected_bars=%d observed_bars=%d missing_price_bars=%d complete=%s reason=%s', contract.symbol, contract.expiration, contract.strike, contract.right, request_date, interval, immediate_attempt + 1, coverage.expected_bars, coverage.observed_bars, coverage.missing_price_bars, coverage.complete, coverage.reason)
+                if coverage.complete:
+                    stored_count = self.persist_first_order_greeks(session, frame, collection_batch)
+                    checkpoint.status = 'COMPLETE'
+                    checkpoint.completed_at = datetime.now()
+                    checkpoint.last_error = None
+                    checkpoint.next_retry_at = None
+                    session.commit()
+                    return stored_count
+                if immediate_attempt < max_retries:
+                    delay = min(60, retry_delay_seconds * (2 ** immediate_attempt))
+                    if delay:
+                        time_module.sleep(delay)
 
-            persist_start = datetime.now()
-            stored_count = self.persist_first_order_greeks(session, frame, collection_batch)
-            persist_elapsed = datetime.now() - persist_start
-            logging.debug(
-                'ThetaData persist for %s on %s at interval %s took %s (seconds=%.2f)',
-                contract,
-                request_date,
-                interval,
-                persist_elapsed,
-                persist_elapsed.total_seconds(),
-            )
-
+            checkpoint.status = 'RETRY'
+            checkpoint.completed_at = None
+            checkpoint.last_error = f'Incomplete history after {max_retries + 1} attempts: {coverage.reason}'[:500]
+            checkpoint.next_retry_at = self._retry_at(checkpoint.attempts or 1)
+            session.commit()
+            return 0
         except ThetaDataEndpointUnavailable as exc:
             checkpoint.status = 'RETRY'
+            checkpoint.completed_at = None
             checkpoint.last_error = str(exc)[:500]
-            checkpoint.next_retry_at = datetime.now() + timedelta(
-                minutes=min(60, 2 ** checkpoint.attempts)
-            )
+            checkpoint.next_retry_at = self._retry_at(checkpoint.attempts or 1)
             session.commit()
             raise
         except Exception as exc:
             checkpoint.status = 'RETRY'
+            checkpoint.completed_at = None
             checkpoint.last_error = self._safe_error(exc)
-            checkpoint.next_retry_at = datetime.now() + timedelta(
-                minutes=min(60, 2 ** checkpoint.attempts)
-            )
+            checkpoint.next_retry_at = self._retry_at(checkpoint.attempts or 1)
             session.commit()
             raise
-
-        checkpoint.status = 'COMPLETE'
-        checkpoint.completed_at = datetime.now()
-        checkpoint.last_error = None
-        checkpoint.next_retry_at = None
-        session.commit()
-        return stored_count
 
     @staticmethod
     def _get_or_create_contract_checkpoint(
@@ -1131,3 +1129,62 @@ class ThetaDataOptionsBackfillCollector:
     def _safe_error(exc: Exception) -> str:
         message = str(exc).strip().replace('\n', ' ')
         return message[:500] or exc.__class__.__name__
+    @staticmethod
+    def _interval_timedelta(interval: str) -> timedelta | None:
+        match = re.fullmatch(r'(\d+)([mh])', interval.strip().lower())
+        if not match or int(match.group(1)) <= 0:
+            return None
+        count = int(match.group(1))
+        return timedelta(minutes=count) if match.group(2) == 'm' else timedelta(hours=count)
+
+    @classmethod
+    def expected_bar_count(cls, request_date: date, interval: str) -> int:
+        """Return regular-session bars, inclusive of opening and closing bars."""
+        cadence = cls._interval_timedelta(interval)
+        if cadence is None:
+            return 0
+        schedule = mcal.get_calendar('NYSE').schedule(
+            start_date=request_date, end_date=request_date
+        )
+        if schedule.empty:
+            return 0
+        market_open = schedule.iloc[0]['market_open']
+        market_close = schedule.iloc[0]['market_close']
+        return int((market_close - market_open).total_seconds() // cadence.total_seconds()) + 1
+
+    @classmethod
+    def assess_history_frame(
+        cls, frame: pl.DataFrame, request_date: date, interval: str
+    ) -> HistoryCoverage:
+        """Require regular-session coverage and usable prices before completion."""
+        expected_bars = cls.expected_bar_count(request_date, interval)
+        if frame.is_empty():
+            return HistoryCoverage(False, expected_bars, 0, 0, 'history response is empty')
+        if expected_bars <= 0:
+            return HistoryCoverage(False, expected_bars, 0, 0, 'not a valid NYSE session')
+
+        observed_bars = frame.get_column('timestamp').n_unique()
+        missing_bid = pl.lit(True) if 'bid' not in frame.columns else pl.col('bid').is_null()
+        missing_ask = pl.lit(True) if 'ask' not in frame.columns else pl.col('ask').is_null()
+        missing_close = pl.lit(True) if 'close' not in frame.columns else pl.col('close').is_null()
+        missing_price_bars = int(
+            frame.select((missing_bid & missing_ask & missing_close).sum()).item()
+        )
+        max_ratio = float(cfg.THETADATA_MISSING_DATA_MAX_RATIO)
+        coverage_gap_ratio = max(0, expected_bars - observed_bars) / expected_bars
+        missing_price_ratio = missing_price_bars / observed_bars if observed_bars else 1.0
+        reasons = []
+        if coverage_gap_ratio > max_ratio:
+            reasons.append(f'coverage {observed_bars}/{expected_bars} (gap={coverage_gap_ratio:.2%})')
+        if missing_price_ratio > max_ratio:
+            reasons.append(
+                f'all-price-null {missing_price_bars}/{observed_bars} ({missing_price_ratio:.2%})'
+            )
+        return HistoryCoverage(
+            not reasons, expected_bars, observed_bars, missing_price_bars,
+            '; '.join(reasons) if reasons else None,
+        )
+
+    @staticmethod
+    def _retry_at(attempts: int) -> datetime:
+        return datetime.now() + timedelta(minutes=min(60, 2 ** attempts))
