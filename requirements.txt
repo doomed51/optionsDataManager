@@ -10,3 +10,7 @@ schedule
 python-dotenv
 thetadata
 pyarrow>=18,<22
+duckdb
+pandas-market-calendars
+plotly
+streamlit
