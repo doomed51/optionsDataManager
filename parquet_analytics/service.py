@@ -32,6 +32,7 @@ MANIFEST_NAME = "_parquet_manifest.json"
 FAILURE_NAME = "_parquet_last_failure.json"
 MAINTENANCE_MARKER_NAME = "_PARQUET_REFRESH_IN_PROGRESS"
 REBUILD_CHECKPOINT_NAME = "_parquet_rebuild_checkpoint.json"
+REBUILD_CHECKPOINT_VERSION = 2
 STAGING_DIRECTORY = "_staging"
 BACKUP_DIRECTORY = "_backup"
 ADVISORY_LOCK_KEY = 0x50415251554554
@@ -103,6 +104,95 @@ class PartitionResult:
             row_count=int(value["row_count"]),
             files=tuple(value.get("files") or ()),
         )
+
+
+@dataclass(frozen=True, order=True)
+class SymbolIntervalKey:
+    symbol: str
+    interval: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"symbol": self.symbol, "interval": self.interval}
+
+
+class _PartitionStreamWriter:
+    """Bounded writer for one monthly partition."""
+
+    def __init__(self, output_directory: Path, key: PartitionKey, config: ParquetConfig) -> None:
+        self.output_directory = output_directory
+        self.key = key
+        self.config = config
+        if output_directory.exists():
+            shutil.rmtree(output_directory)
+        output_directory.mkdir(parents=True, exist_ok=True)
+        self.writer: pq.ParquetWriter | None = None
+        self.file_path: Path | None = None
+        self.file_index = 0
+        self.file_uncompressed_bytes = 0
+        self.total_rows = 0
+        self.files: list[dict[str, Any]] = []
+        self.records: list[dict[str, Any]] = []
+
+    def add(self, row: Any) -> None:
+        self.records.append(source_row_to_dict(row))
+        self.total_rows += 1
+        if len(self.records) >= self.config.refresh_batch_size:
+            self._write_records()
+
+    def finish(self) -> PartitionResult:
+        if self.records:
+            self._write_records()
+        self._close_file()
+        return PartitionResult(
+            key=self.key,
+            row_count=self.total_rows,
+            files=tuple(self.files),
+        )
+
+    def abort(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+    def _write_records(self) -> None:
+        table = pa.Table.from_pylist(self.records, schema=OUTPUT_SCHEMA)
+        if (
+            self.writer is not None
+            and self.file_uncompressed_bytes + table.nbytes
+            > self.config.target_file_size_bytes
+        ):
+            self._close_file()
+        if self.writer is None:
+            self.file_path = self.output_directory / f"part-{self.file_index:05d}.parquet"
+            self.file_index += 1
+            self.writer = pq.ParquetWriter(
+                self.file_path,
+                OUTPUT_SCHEMA,
+                compression=self.config.compression,
+                compression_level=self.config.compression_level,
+                use_dictionary=True,
+                write_statistics=True,
+            )
+        self.writer.write_table(table, row_group_size=len(self.records))
+        self.file_uncompressed_bytes += table.nbytes
+        self.records = []
+
+    def _close_file(self) -> None:
+        if self.writer is None or self.file_path is None:
+            return
+        self.writer.close()
+        parquet_file = pq.ParquetFile(self.file_path)
+        self.files.append(
+            {
+                "name": self.file_path.name,
+                "rows": parquet_file.metadata.num_rows,
+                "bytes": self.file_path.stat().st_size,
+                "sha256": _sha256(self.file_path),
+            }
+        )
+        self.writer = None
+        self.file_path = None
+        self.file_uncompressed_bytes = 0
 
 
 def encode_partition_value(value: str) -> str:
@@ -222,36 +312,63 @@ class ParquetLayerService:
                     assert start_date is not None and end_date is not None
                     partitions = self._partitions_in_date_range(start_date, end_date)
                 else:
-                    partitions = self._all_partitions()
+                    symbol_intervals = self._symbol_interval_pairs()
                     self._validate_rebuild_disk_space(root)
 
-                marker["partitions"] = [item.as_dict() for item in partitions]
                 if job_type == "rebuild":
-                    stage_root, staged_results = self._prepare_rebuild_staging(
-                        root, stage_root, partitions, upper_watermark
+                    marker["symbol_intervals"] = [item.as_dict() for item in symbol_intervals]
+                    stage_root, staged_results, completed_pairs = self._prepare_rebuild_staging(
+                        root, stage_root, symbol_intervals, upper_watermark
                     )
                     marker["staging_job_id"] = stage_root.name
+                else:
+                    marker["partitions"] = [item.as_dict() for item in partitions]
                 self._atomic_write_json(root / MAINTENANCE_MARKER_NAME, marker)
-                already_staged = {item.key for item in staged_results}
-                for partition in partitions:
-                    if partition in already_staged:
-                        _log_event("parquet_partition_resumed", job_id=job_id, **partition.as_dict())
-                        continue
-                    partition_started = time_module.monotonic()
-                    result = self._write_partition(stage_root, partition)
-                    staged_results.append(result)
-                    if job_type == "rebuild":
-                        self._write_rebuild_checkpoint(
-                            root, stage_root, partitions, staged_results, upper_watermark
+                if job_type == "rebuild":
+                    for pair in symbol_intervals:
+                        if pair in completed_pairs:
+                            _log_event(
+                                "parquet_symbol_interval_resumed",
+                                job_id=job_id,
+                                **pair.as_dict(),
+                            )
+                            continue
+                        pair_started = time_module.monotonic()
+                        rows_before = sum(item.row_count for item in staged_results)
+                        self._stream_rebuild_pair(
+                            root=root,
+                            stage_root=stage_root,
+                            pair=pair,
+                            symbol_intervals=symbol_intervals,
+                            results=staged_results,
+                            completed_pairs=completed_pairs,
+                            source_watermark=upper_watermark,
+                            job_id=job_id,
                         )
-                    _log_event(
-                        "parquet_partition_staged",
-                        job_id=job_id,
-                        **partition.as_dict(),
-                        rows=result.row_count,
-                        files=len(result.files),
-                        duration_seconds=round(time_module.monotonic() - partition_started, 3),
-                    )
+                        _log_event(
+                            "parquet_symbol_interval_staged",
+                            job_id=job_id,
+                            **pair.as_dict(),
+                            rows=sum(item.row_count for item in staged_results) - rows_before,
+                            duration_seconds=round(
+                                time_module.monotonic() - pair_started, 3
+                            ),
+                        )
+                else:
+                    for partition in partitions:
+                        partition_started = time_module.monotonic()
+                        result = self._write_partition(stage_root, partition)
+                        staged_results.append(result)
+                        _log_event(
+                            "parquet_partition_staged",
+                            job_id=job_id,
+                            **partition.as_dict(),
+                            rows=result.row_count,
+                            files=len(result.files),
+                            duration_seconds=round(
+                                time_module.monotonic() - partition_started, 3
+                            ),
+                        )
 
                 self._publish_results(root, stage_root, backup_root, staged_results, marker, actions)
                 if job_type == "rebuild":
@@ -348,8 +465,26 @@ class ParquetLayerService:
         finally:
             session.close()
 
-    def _all_partitions(self) -> list[PartitionKey]:
-        return self._partition_query()
+    def _symbol_interval_pairs(self) -> list[SymbolIntervalKey]:
+        statement = (
+            select(
+                ThetaDataOptionHistory.symbol,
+                ThetaDataOptionHistory.interval,
+            )
+            .distinct()
+            .order_by(
+                ThetaDataOptionHistory.symbol,
+                ThetaDataOptionHistory.interval,
+            )
+        )
+        session = self.session_factory()
+        try:
+            return [
+                SymbolIntervalKey(str(row.symbol), str(row.interval))
+                for row in session.execute(statement)
+            ]
+        finally:
+            session.close()
 
     def _affected_partitions(
         self, previous: datetime | None, upper: datetime | None
@@ -420,17 +555,29 @@ class ParquetLayerService:
         finally:
             session.close()
 
-    def _partition_row_count(self, key: PartitionKey) -> int:
-        start, end = _month_bounds(key)
-        statement = select(func.count(ThetaDataOptionHistory.id)).where(
-            ThetaDataOptionHistory.symbol == key.symbol,
-            ThetaDataOptionHistory.interval == key.interval,
-            ThetaDataOptionHistory.timestamp >= start,
-            ThetaDataOptionHistory.timestamp < end,
+    def _iter_symbol_interval_rows(
+        self,
+        pair: SymbolIntervalKey,
+        start_timestamp: datetime | None = None,
+    ) -> Iterator[Any]:
+        statement = select(ThetaDataOptionHistory).where(
+            ThetaDataOptionHistory.symbol == pair.symbol,
+            ThetaDataOptionHistory.interval == pair.interval,
         )
+        if start_timestamp is not None:
+            statement = statement.where(
+                ThetaDataOptionHistory.timestamp >= start_timestamp
+            )
+        statement = statement.order_by(
+            ThetaDataOptionHistory.timestamp,
+            ThetaDataOptionHistory.expiry,
+            ThetaDataOptionHistory.strike,
+            ThetaDataOptionHistory.right,
+            ThetaDataOptionHistory.id,
+        ).execution_options(yield_per=self.config.refresh_batch_size)
         session = self.session_factory()
         try:
-            return int(session.execute(statement).scalar_one())
+            yield from session.execute(statement).scalars()
         finally:
             session.close()
 
@@ -438,137 +585,212 @@ class ParquetLayerService:
         self,
         root: Path,
         default_stage_root: Path,
-        partitions: list[PartitionKey],
+        symbol_intervals: list[SymbolIntervalKey],
         source_watermark: datetime | None,
-    ) -> tuple[Path, list[PartitionResult]]:
+    ) -> tuple[Path, list[PartitionResult], set[SymbolIntervalKey]]:
         checkpoint = self._read_json(root / REBUILD_CHECKPOINT_NAME)
-        expected_partitions = [item.as_dict() for item in partitions]
+        expected_pairs = [item.as_dict() for item in symbol_intervals]
         expected_watermark = _iso_utc(source_watermark)
         if checkpoint:
-            checkpoint_stage = root / STAGING_DIRECTORY / str(checkpoint.get("staging_job_id", ""))
+            staging_job_id = str(checkpoint.get("staging_job_id") or "")
+            safe_staging_job_id = (
+                bool(staging_job_id)
+                and Path(staging_job_id).name == staging_job_id
+                and staging_job_id not in {".", ".."}
+            )
+            checkpoint_stage = (
+                root / STAGING_DIRECTORY / staging_job_id
+                if safe_staging_job_id
+                else default_stage_root
+            )
             compatible = (
-                checkpoint.get("schema_version") == SCHEMA_VERSION
+                checkpoint.get("checkpoint_version") == REBUILD_CHECKPOINT_VERSION
+                and checkpoint.get("schema_version") == SCHEMA_VERSION
                 and checkpoint.get("source_watermark") == expected_watermark
-                and checkpoint.get("partitions") == expected_partitions
+                and checkpoint.get("symbol_intervals") == expected_pairs
+                and safe_staging_job_id
                 and checkpoint_stage.is_dir()
             )
             if compatible:
                 try:
+                    staged_entries = checkpoint.get("staged_partitions", [])
+                    if any(
+                        item.get("status") != "committed"
+                        for item in staged_entries
+                    ):
+                        raise ParquetValidationError(
+                            "Rebuild checkpoint contains an uncommitted partition"
+                        )
                     results = [
                         PartitionResult.from_manifest_entry(item)
-                        for item in checkpoint.get("staged_partitions", [])
+                        for item in staged_entries
                     ]
+                    completed_pairs = {
+                        SymbolIntervalKey(
+                            symbol=str(item["symbol"]),
+                            interval=str(item["interval"]),
+                        )
+                        for item in checkpoint.get("completed_symbol_intervals", [])
+                    }
+                    expected_pair_set = set(symbol_intervals)
+                    if not completed_pairs.issubset(expected_pair_set):
+                        raise ParquetValidationError(
+                            "Rebuild checkpoint contains an unknown completed symbol/interval pair"
+                        )
+                    result_keys: set[PartitionKey] = set()
                     for result in results:
-                        self._validate_partition(checkpoint_stage / result.key.relative_path(), result)
-                        source_count = self._partition_row_count(result.key)
-                        if source_count != result.row_count:
+                        pair = SymbolIntervalKey(result.key.symbol, result.key.interval)
+                        if pair not in expected_pair_set:
                             raise ParquetValidationError(
-                                f"Source row count changed for resumable partition {result.key}"
+                                f"Rebuild checkpoint contains an unknown partition {result.key}"
                             )
-                    return checkpoint_stage, results
+                        if result.key in result_keys:
+                            raise ParquetValidationError(
+                                f"Rebuild checkpoint contains a duplicate partition {result.key}"
+                            )
+                        result_keys.add(result.key)
+                        self._validate_partition(checkpoint_stage / result.key.relative_path(), result)
+                    return checkpoint_stage, results, completed_pairs
                 except Exception:
                     logger.exception("Discarding an invalid Parquet rebuild checkpoint")
-            if checkpoint_stage.is_dir():
+            if safe_staging_job_id and checkpoint_stage.is_dir():
                 shutil.rmtree(checkpoint_stage)
             (root / REBUILD_CHECKPOINT_NAME).unlink(missing_ok=True)
 
         self._write_rebuild_checkpoint(
-            root, default_stage_root, partitions, [], source_watermark
+            root,
+            default_stage_root,
+            symbol_intervals,
+            [],
+            set(),
+            source_watermark,
         )
-        return default_stage_root, []
+        return default_stage_root, [], set()
 
     def _write_rebuild_checkpoint(
         self,
         root: Path,
         stage_root: Path,
-        partitions: list[PartitionKey],
+        symbol_intervals: list[SymbolIntervalKey],
         results: list[PartitionResult],
+        completed_pairs: set[SymbolIntervalKey],
         source_watermark: datetime | None,
     ) -> None:
         self._atomic_write_json(
             root / REBUILD_CHECKPOINT_NAME,
             {
+                "checkpoint_version": REBUILD_CHECKPOINT_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "source_watermark": _iso_utc(source_watermark),
                 "staging_job_id": stage_root.name,
-                "partitions": [item.as_dict() for item in partitions],
+                "symbol_intervals": [item.as_dict() for item in symbol_intervals],
+                "completed_symbol_intervals": [
+                    item.as_dict() for item in sorted(completed_pairs)
+                ],
                 "staged_partitions": [item.as_manifest_entry() for item in results],
             },
         )
 
-    def _write_partition(self, stage_root: Path, key: PartitionKey) -> PartitionResult:
-        output_directory = stage_root / key.relative_path()
-        if output_directory.exists():
-            shutil.rmtree(output_directory)
-        output_directory.mkdir(parents=True, exist_ok=True)
-        # authoritative_row_count = self._partition_row_count(key)
-        writer: pq.ParquetWriter | None = None
-        file_path: Path | None = None
-        file_index = 0
-        file_uncompressed_bytes = 0
-        total_rows = 0
-        files: list[dict[str, Any]] = []
-        records: list[dict[str, Any]] = []
+    def _stream_rebuild_pair(
+        self,
+        *,
+        root: Path,
+        stage_root: Path,
+        pair: SymbolIntervalKey,
+        symbol_intervals: list[SymbolIntervalKey],
+        results: list[PartitionResult],
+        completed_pairs: set[SymbolIntervalKey],
+        source_watermark: datetime | None,
+        job_id: str,
+    ) -> None:
+        pair_results = [
+            result
+            for result in results
+            if result.key.symbol == pair.symbol and result.key.interval == pair.interval
+        ]
+        start_timestamp = None
+        if pair_results:
+            last_key = max(result.key for result in pair_results)
+            start_timestamp = _month_bounds(last_key)[1]
 
-        def close_writer() -> None:
-            nonlocal writer, file_path, file_uncompressed_bytes
-            if writer is None or file_path is None:
+        rows = self._iter_symbol_interval_rows(pair, start_timestamp)
+        writer: _PartitionStreamWriter | None = None
+        current_key: PartitionKey | None = None
+        partition_started = time_module.monotonic()
+
+        def complete_partition() -> None:
+            nonlocal writer, current_key, partition_started
+            if writer is None or current_key is None:
                 return
-            writer.close()
-            parquet_file = pq.ParquetFile(file_path)
-            files.append(
-                {
-                    "name": file_path.name,
-                    "rows": parquet_file.metadata.num_rows,
-                    "bytes": file_path.stat().st_size,
-                    "sha256": _sha256(file_path),
-                }
-            )
+            result = writer.finish()
             writer = None
-            file_path = None
-            file_uncompressed_bytes = 0
-
-        def write_records(batch_records: list[dict[str, Any]]) -> None:
-            nonlocal writer, file_path, file_index, file_uncompressed_bytes
-            table = pa.Table.from_pylist(batch_records, schema=OUTPUT_SCHEMA)
-            if writer is not None and file_uncompressed_bytes + table.nbytes > self.config.target_file_size_bytes:
-                close_writer()
-            if writer is None:
-                file_path = output_directory / f"part-{file_index:05d}.parquet"
-                file_index += 1
-                writer = pq.ParquetWriter(
-                    file_path,
-                    OUTPUT_SCHEMA,
-                    compression=self.config.compression,
-                    compression_level=self.config.compression_level,
-                    use_dictionary=True,
-                    write_statistics=True,
-                )
-            writer.write_table(table, row_group_size=len(batch_records))
-            file_uncompressed_bytes += table.nbytes
+            self._validate_partition(stage_root / current_key.relative_path(), result)
+            results.append(result)
+            self._write_rebuild_checkpoint(
+                root,
+                stage_root,
+                symbol_intervals,
+                results,
+                completed_pairs,
+                source_watermark,
+            )
+            _log_event(
+                "parquet_partition_staged",
+                job_id=job_id,
+                **current_key.as_dict(),
+                rows=result.row_count,
+                files=len(result.files),
+                duration_seconds=round(time_module.monotonic() - partition_started, 3),
+            )
+            current_key = None
 
         try:
-            for row in self._iter_partition_rows(key):
-                records.append(source_row_to_dict(row))
-                total_rows += 1
-                if len(records) >= self.config.refresh_batch_size:
-                    write_records(records)
-                    records = []
-            if records:
-                write_records(records)
-            close_writer()
-        except Exception:
+            for row in rows:
+                timestamp = row.timestamp
+                if timestamp.tzinfo is not None:
+                    timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+                key = PartitionKey(pair.symbol, pair.interval, timestamp.year, timestamp.month)
+                if key != current_key:
+                    complete_partition()
+                    current_key = key
+                    partition_started = time_module.monotonic()
+                    writer = _PartitionStreamWriter(
+                        stage_root / key.relative_path(),
+                        key,
+                        self.config,
+                    )
+                assert writer is not None
+                writer.add(row)
+            complete_partition()
+            completed_pairs.add(pair)
+            self._write_rebuild_checkpoint(
+                root,
+                stage_root,
+                symbol_intervals,
+                results,
+                completed_pairs,
+                source_watermark,
+            )
+        except BaseException:
             if writer is not None:
-                writer.close()
+                writer.abort()
             raise
+        finally:
+            close = getattr(rows, "close", None)
+            if close is not None:
+                close()
 
-        result = PartitionResult(key=key, row_count=total_rows, files=tuple(files))
+    def _write_partition(self, stage_root: Path, key: PartitionKey) -> PartitionResult:
+        output_directory = stage_root / key.relative_path()
+        writer = _PartitionStreamWriter(output_directory, key, self.config)
+        try:
+            for row in self._iter_partition_rows(key):
+                writer.add(row)
+            result = writer.finish()
+        except BaseException:
+            writer.abort()
+            raise
         self._validate_partition(output_directory, result)
-        # if result.row_count != authoritative_row_count:
-        #     raise ParquetValidationError(
-        #         f"Source row count changed while rebuilding {key}: "
-        #         f"expected {authoritative_row_count}, exported {result.row_count}"
-        #     )
         return result
 
     @staticmethod
