@@ -13,6 +13,7 @@ from parquet_analytics.inspection import (
     ParquetInspectionError,
     ParquetInspectionService,
 )
+from parquet_analytics.dashboard import delta_heatmap_colorscale
 
 
 st.set_page_config(page_title="Options Parquet Inspector", page_icon="🔎", layout="wide")
@@ -76,8 +77,13 @@ def render_delta_heatmap(frame: pd.DataFrame, right: str) -> None:
     ).fillna(0)
     ordered = [f"{value / 10:.1f}–{value / 10 + 0.1:.1f}" for value in range(10)]
     pivot = pivot.reindex(ordered, fill_value=0)
+    max_contract_count = max(1, int(pivot.to_numpy().max()))
     figure = px.imshow(
-        pivot, aspect="auto", color_continuous_scale="Blues",
+        pivot,
+        aspect="auto",
+        color_continuous_scale=delta_heatmap_colorscale(max_contract_count),
+        zmin=0,
+        zmax=max_contract_count,
         labels={"x": "Trading date", "y": "Absolute delta", "color": "Contracts"},
     )
     figure.update_layout(margin=dict(l=10, r=10, t=20, b=10), height=360)
