@@ -136,8 +136,11 @@ Do not start analytics while that marker is present. Refreshes stage and
 validate complete monthly partitions before swapping them into place; failed
 publication restores the prior partition. A full rebuild may temporarily need
 about twice the live dataset's disk space.
-Validated monthly partitions from an interrupted full rebuild are retained and
-reused when the source watermark and partition set are unchanged.
+Full rebuilds issue one bounded, timestamp-ordered source stream per
+symbol/interval pair and checkpoint each completed UTC month. Restart the same
+rebuild command after an interruption: validated completed months are reused,
+the incomplete month is rewritten, and completed pairs are skipped when the
+source watermark, pair list, schema, staged files, and checksums are unchanged.
 
 R Arrow opens the configured root directly:
 
