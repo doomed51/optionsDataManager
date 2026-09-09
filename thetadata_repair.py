@@ -66,7 +66,7 @@ def repair_thetadata_data(
         if end_date:
             query = query.filter(ThetaDataCollectionCheckpoint.trade_date <= end_date)
 
-        for checkpoint in query.order_by(ThetaDataCollectionCheckpoint.trade_date).yield_per(100):
+        for checkpoint in query.order_by(ThetaDataCollectionCheckpoint.trade_date).all():
             summary.audited += 1
             day_start = datetime.combine(checkpoint.trade_date, time.min)
             day_end = day_start + timedelta(days=1)
