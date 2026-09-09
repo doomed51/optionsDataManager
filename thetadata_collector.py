@@ -335,7 +335,7 @@ class ThetaDataOptionsBackfillCollector:
 
         if len(expirations_with_data) == 0:
             logging.warning('No expirations with available data for %s on %s', symbol, trade_date)
-            exit() 
+            # exit() 
             return None 
         
         logging.debug('Found %d expirations with available data for %s on %s', len(expirations_with_data), symbol, trade_date)
@@ -664,6 +664,7 @@ class ThetaDataOptionsBackfillCollector:
             'quote', contract, request_date, interval, self.QUOTE_COLUMNS,
             {'bid': 'bid', 'ask': 'ask', 'bid_size': 'bid_size', 'ask_size': 'ask_size'},
         )
+        print(quote) 
         ohlc = self._fetch_and_normalize(
             'ohlc', contract, request_date, interval, self.OHLC_COLUMNS,
             {'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume',
